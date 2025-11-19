@@ -74,6 +74,8 @@ npm run dev
 
 ## Render deployment guide
 
+Render currently defaults new Python services to 3.13.x, which breaks the SQLAlchemy version in this repo. The `.python-version` file in the repo root pins deployments to 3.11.9. If you rename or remove it, set the `PYTHON_VERSION` env var on Render instead.
+
 1. **Push the repository to GitHub** so Render can pull from `main`.
 2. **Create a PostgreSQL instance on Render** (Free tier is fine to start). Copy the *External Database URL* and the *Internal Database URL*; you can use either, but the internal URL avoids public traffic when the backend is on Render too.
 3. **Provision the backend web service:**
