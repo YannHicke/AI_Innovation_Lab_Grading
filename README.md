@@ -39,13 +39,21 @@ frontend/
 ### Backend
 
 ```bash
+# Make sure you're on Python 3.11 (see `.python-version`).
+# If `python3` points at another version, run `pyenv local 3.11.9`
+# in the repo root or install Homebrew's python@3.11 and call python3.11.
 cd backend
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env  # tweak APP_DATABASE_URL if needed
 uvicorn app.main:app --reload --port 8000
 ```
+
+Using Python 3.13+ will force `psycopg2-binary` to compile from source and
+currently fails, which is why the repo pins 3.11.9. `uvicorn` is included in
+`requirements.txt`, so you do not need to install it with Homebrew once the
+virtualenv is active.
 
 Key environment variables (defined in `.env`):
 
