@@ -18,6 +18,27 @@ class CriterionScoreResponse(CriterionScoreBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+class AssignmentResponse(BaseModel):
+    id: int
+    title: str
+    cohort: Optional[str] = None
+    description: Optional[str] = None
+    due_date: Optional[datetime] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserResponse(BaseModel):
+    id: int
+    email: str
+    full_name: Optional[str] = None
+    role: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class EvaluationResponse(BaseModel):
     id: int
     rubric_title: str
@@ -27,7 +48,10 @@ class EvaluationResponse(BaseModel):
     max_total_score: float
     performance_band: Optional[str]
     share_with_student: bool
+    student_identifier: Optional[str] = None
     created_at: datetime
+    assignment: Optional[AssignmentResponse] = None
+    grader: Optional[UserResponse] = None
     criterion_scores: List[CriterionScoreResponse]
 
     model_config = ConfigDict(from_attributes=True)
@@ -39,7 +63,10 @@ class EvaluationListItem(BaseModel):
     total_score: float
     max_total_score: float
     performance_band: Optional[str]
+    student_identifier: Optional[str] = None
     created_at: datetime
+    assignment: Optional[AssignmentResponse] = None
+    grader: Optional[UserResponse] = None
 
     model_config = ConfigDict(from_attributes=True)
 

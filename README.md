@@ -9,7 +9,6 @@ A lightweight patient communication transcript grader. The React frontend (hoste
 - **Database:** PostgreSQL on Render (falls back to local SQLite for development)
 - **Automation:** GitHub Actions workflow that builds the frontend and publishes it to Pages on every push to `main`
 
-The `evaluate_pdf_transcripts.py` script in the repo documents a multi-stage workflow that inspired the scoring pipeline implemented in the backend services.
 
 ## Repository layout
 
@@ -129,4 +128,3 @@ All of the above complete without errors, confirming both stacks compile/build l
 
 - Replace the keyword-based scorer in `backend/app/services/scoring.py` with the full multi-stage pipeline from `evaluate_pdf_transcripts.py` once model credentials and OCR helpers are ready.
 - Expand the database schema with user accounts or assignment metadata if multiple cohorts will use the tool simultaneously.
-- Harden file handling by uploading rubrics to S3 or Render Disks if you need to persist the original PDFs.

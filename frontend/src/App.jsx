@@ -99,20 +99,6 @@ function App() {
             {loadingHistory ? 'Refreshing…' : 'Load latest results'}
           </button>
         </div>
-        <div className="metrics">
-          <div>
-            <p className="label">Backend</p>
-            <p className="value">FastAPI</p>
-          </div>
-          <div>
-            <p className="label">Hosting</p>
-            <p className="value">Render + GH Pages</p>
-          </div>
-          <div>
-            <p className="label">Storage</p>
-            <p className="value">PostgreSQL</p>
-          </div>
-        </div>
       </header>
 
       <main className="content-grid">
