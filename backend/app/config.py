@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import List
+from typing import List, Literal, Optional
 
 from pydantic_settings import BaseSettings
 
@@ -13,6 +13,13 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
     ]
     share_results_default: bool = True
+    llm_provider: Literal["openai"] = "openai"
+    llm_model: str = "gpt-4o-mini"
+    llm_base_url: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    llm_temperature: float = 0.2
+    llm_max_output_tokens: int = 6000
+    log_level: str = "INFO"
 
     class Config:
         env_file = ".env"

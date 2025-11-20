@@ -59,6 +59,10 @@ Key environment variables (defined in `.env`):
 - `APP_DATABASE_URL`: Defaults to `sqlite:///./grader.db` for local dev. Point it to your PostgreSQL URL in production.
 - `APP_ALLOWED_ORIGINS`: JSON list of URLs that may call the API (e.g. `["http://localhost:5173"]`).
 - `APP_SHARE_RESULTS_DEFAULT`: Optional boolean default for the UI toggle.
+- `APP_OPENAI_API_KEY`: Required. Used by the LLM-based rubric parser.
+- `APP_LLM_MODEL`: Defaults to `gpt-4o-mini`, override if you want to call a different OpenAI model.
+- `APP_LLM_BASE_URL`: Optional override if you're routing through a proxy or Azure endpoint.
+- `APP_LLM_TEMPERATURE` / `APP_LLM_MAX_OUTPUT_TOKENS`: Advanced controls for prompt behavior.
 
 ### Frontend
 
