@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, joinedload
 
 from .config import get_settings
-from .database import Base, engine, ensure_sqlite_schema, get_db
+from .database import Base, engine, ensure_schema, get_db
 from .models import Assignment, CriterionScore, Evaluation, Rubric, RubricItem, RubricLevel, User
 from .schemas import EvaluationCreateResponse, EvaluationListItem, EvaluationResponse
 from .services.rubric_parser import RubricParsingError, parse_rubric, pdf_bytes_to_text
@@ -21,7 +21,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 Base.metadata.create_all(bind=engine)
-ensure_sqlite_schema()
+ensure_schema()
 
 app = FastAPI(title="AI Innovation Lab Grading API", version="0.1.0")
 app.add_middleware(
@@ -36,7 +36,7 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
-    ensure_sqlite_schema()
+    ensure_schema()
 
 
 @app.get("/api/health")

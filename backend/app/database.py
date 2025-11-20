@@ -21,12 +21,16 @@ def get_db():
         db.close()
 
 
-def ensure_sqlite_schema() -> None:
-    """Apply lightweight schema upgrades when running on SQLite without Alembic."""
+def ensure_schema() -> None:
+    """Apply lightweight schema upgrades for SQLite and Postgres deployments."""
 
-    if not settings.database_url.startswith("sqlite"):
-        return
+    if settings.database_url.startswith("sqlite"):
+        _ensure_sqlite_schema()
+    else:
+        _ensure_postgres_schema()
 
+
+def _ensure_sqlite_schema() -> None:
     inspector = inspect(engine)
 
     def _column_exists(table: str, column: str) -> bool:
@@ -48,4 +52,27 @@ def ensure_sqlite_schema() -> None:
 
     with engine.begin() as connection:
         for table, ddl in statements:
+            connection.execute(text(ddl))
+
+
+def _ensure_postgres_schema() -> None:
+    statements = [
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS assignment_id INTEGER REFERENCES assignments(id)",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS grader_id INTEGER REFERENCES users(id)",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS rubric_id INTEGER REFERENCES rubrics(id)",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS student_identifier VARCHAR(255)",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS share_with_student BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS rubric_summary TEXT",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS feedback_summary TEXT",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS total_score DOUBLE PRECISION DEFAULT 0",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS max_total_score DOUBLE PRECISION DEFAULT 0",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS performance_band VARCHAR(50)",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS rubric_title VARCHAR(255)",
+        "ALTER TABLE criterion_scores ADD COLUMN IF NOT EXISTS rubric_item_id INTEGER REFERENCES rubric_items(id)",
+        "ALTER TABLE criterion_scores ADD COLUMN IF NOT EXISTS evidence TEXT",
+        "ALTER TABLE criterion_scores ADD COLUMN IF NOT EXISTS justification TEXT",
+    ]
+
+    with engine.begin() as connection:
+        for ddl in statements:
             connection.execute(text(ddl))
