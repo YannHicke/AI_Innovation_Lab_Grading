@@ -79,9 +79,24 @@ class EvaluationListItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class GeneratedPrompt(BaseModel):
+    criterion_name: str
+    prompt_text: str
+
+
+class RubricParsingInfo(BaseModel):
+    items_extracted: int
+    rubric_title: str
+    rubric_type: str
+    max_total_score: float
+    criteria_names: List[str]
+    generated_prompts: List[GeneratedPrompt]
+
+
 class EvaluationCreateResponse(BaseModel):
     evaluation: EvaluationResponse
     message: str
+    parsing_info: Optional[RubricParsingInfo] = None
 
 
 class RubricLevelResponse(BaseModel):

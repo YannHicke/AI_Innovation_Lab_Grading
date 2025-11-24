@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Any, Dict, List
 
 from openai import OpenAI
+from anthropic import Anthropic
 
 from ..config import get_settings
 
@@ -48,33 +49,48 @@ class ScoringError(RuntimeError):
 
 @dataclass
 class LLMScoringClient:
-    client: OpenAI
+    client: Any  # OpenAI or Anthropic
     model: str
     temperature: float
     max_output_tokens: int
+    provider: str
 
     def score_item(self, *, prompt: str) -> Dict[str, Any]:
         logger.debug("LLM scoring prompt input: %s", prompt[:2000])
         try:
-            response = self.client.responses.create(
-                model=self.model,
-                instructions=ITEM_SYSTEM_PROMPT,
-                input=prompt,
-                temperature=self.temperature,
-                max_output_tokens=self.max_output_tokens,
-                text={"format": SCORING_ITEM_FORMAT},
-            )
-            logger.info(
-                "LLM scoring response for prompt hash=%s: status=%s usage=%s output_preview=%s",
-                hash(prompt),
-                getattr(response, "status", "completed"),
-                getattr(response, "usage", None),
-                getattr(response, "output_text", "")[:400] if getattr(response, "output_text", None) else "",
-            )
+            if self.provider == "anthropic":
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=self.max_output_tokens,
+                    temperature=self.temperature,
+                    system=ITEM_SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                payload = response.content[0].text
+                logger.info(
+                    "LLM scoring response for prompt hash=%s: usage=%s",
+                    hash(prompt),
+                    response.usage,
+                )
+            else:  # openai
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": ITEM_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=self.temperature,
+                    max_tokens=self.max_output_tokens,
+                    response_format={"type": "json_object"}
+                )
+                payload = response.choices[0].message.content
+                logger.info(
+                    "LLM scoring response for prompt hash=%s: usage=%s",
+                    hash(prompt),
+                    response.usage,
+                )
         except Exception as exc:  # pragma: no cover - network failure pass-through
             raise ScoringError(f"LLM scoring request failed: {exc}") from exc
-
-        payload = _extract_output_text(response)
 
         try:
             return json.loads(payload)
@@ -186,48 +202,32 @@ def performance_band(percent: float) -> str:
 @lru_cache()
 def _get_llm_scorer() -> LLMScoringClient:
     settings = get_settings()
-    if settings.llm_provider != "openai":  # pragma: no cover - single provider guard
+
+    if settings.llm_provider not in ["openai", "anthropic"]:
         raise ScoringError(f"Unsupported LLM provider: {settings.llm_provider}")
-    if not settings.openai_api_key:
-        raise ScoringError("OpenAI API key is not configured (APP_OPENAI_API_KEY).")
+
     if not settings.llm_model:
         raise ScoringError("LLM model is not configured (APP_LLM_MODEL).")
 
-    client_kwargs: Dict[str, Any] = {"api_key": settings.openai_api_key}
-    if settings.llm_base_url:
-        client_kwargs["base_url"] = settings.llm_base_url
+    if settings.llm_provider == "anthropic":
+        if not settings.anthropic_api_key:
+            raise ScoringError("Anthropic API key is not configured (APP_ANTHROPIC_API_KEY).")
+        client = Anthropic(api_key=settings.anthropic_api_key)
+    else:  # openai
+        if not settings.openai_api_key:
+            raise ScoringError("OpenAI API key is not configured (APP_OPENAI_API_KEY).")
+        client_kwargs: Dict[str, Any] = {"api_key": settings.openai_api_key}
+        if settings.llm_base_url:
+            client_kwargs["base_url"] = settings.llm_base_url
+        client = OpenAI(**client_kwargs)
 
-    client = OpenAI(**client_kwargs)
     return LLMScoringClient(
         client=client,
         model=settings.llm_model,
         temperature=settings.llm_temperature,
         max_output_tokens=settings.llm_max_output_tokens,
+        provider=settings.llm_provider,
     )
-
-
-def _extract_output_text(response: Any) -> str:
-    direct = getattr(response, "output_text", None)
-    if direct:
-        return direct
-
-    output = getattr(response, "output", None) or []
-    fragments: List[str] = []
-    for block in output:
-        content = getattr(block, "content", None) or getattr(block, "output", None)
-        if not content:
-            continue
-        for item in content:
-            text = getattr(item, "text", None)
-            if text:
-                fragments.append(text)
-            elif isinstance(item, dict) and item.get("text"):
-                fragments.append(str(item["text"]))
-
-    if not fragments:
-        raise ScoringError("LLM scoring response did not contain any text output.")
-
-    return "\n".join(fragments)
 
 
 def _build_item_prompt(item: Dict[str, Any], transcript_text: str, rubric_type: str) -> str:
@@ -237,8 +237,23 @@ def _build_item_prompt(item: Dict[str, Any], transcript_text: str, rubric_type: 
     checklist_required = metadata.get("checklist_required")
 
     lines: List[str] = [
-        "You will be given the transcript of a medical interview between a medical student (physician) and a patient.",
-        "Your task is to evaluate ONLY the following rubric item and return JSON matching the schema.",
+        "You are an impartial assessor of clinical interview skills. You will receive:",
+        "All rubric criterion (including its name, description, and scoring scale).",
+        "",
+        "A cleaned transcript.",
+        "",
+        "Your tasks:",
+        "Score only this specific criterion at a time before moving to the next.",
+        "",
+        "Provide:",
+        "- The numeric score.",
+        "- A brief justification (1–2 sentences).",
+        "- Evidence taken directly from the transcript as an exact quote.",
+        "",
+        "Rules:",
+        "- Do not reference any other criteria.",
+        "- Do not invent or assume transcript content.",
+        "- Evidence must be a verbatim quotation from the transcript.",
         "",
         f"Rubric item: {item['name']}",
         f"Description: {description}",
@@ -258,10 +273,7 @@ def _build_item_prompt(item: Dict[str, Any], transcript_text: str, rubric_type: 
             lines.append(f"- Score {score_value}: {detail} ({label})")
 
     lines.append(
-        "\nFollow these steps:\n"
-        "1. Scoring: Assess the student's performance solely for this rubric item using the scale.\n"
-        "2. Justification: Assign a score and explain it with direct transcript quotes.\n"
-        "Return ONLY JSON with the keys 'evaluation' -> {'score': number, 'justification': string}."
+        "\nReturn ONLY JSON with the keys 'evaluation' -> {'score': number, 'justification': string}."
     )
     lines.append("\nTranscript:\n" + transcript_text.strip())
     return "\n".join(lines)

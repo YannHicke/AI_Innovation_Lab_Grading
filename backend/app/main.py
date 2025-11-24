@@ -11,9 +11,9 @@ from sqlalchemy.orm import Session, joinedload
 from .config import get_settings
 from .database import Base, engine, ensure_schema, get_db
 from .models import Assignment, CriterionScore, Evaluation, Rubric, RubricItem, RubricLevel, User
-from .schemas import EvaluationCreateResponse, EvaluationListItem, EvaluationResponse
+from .schemas import EvaluationCreateResponse, EvaluationListItem, EvaluationResponse, GeneratedPrompt, RubricParsingInfo
 from .services.rubric_parser import RubricParsingError, parse_rubric, pdf_bytes_to_text
-from .services.scoring import ScoringError, score_criteria
+from .services.scoring import ScoringError, score_criteria, _build_item_prompt
 
 settings = get_settings()
 logging.basicConfig(
@@ -42,6 +42,214 @@ def on_startup() -> None:
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.post("/api/rubrics/parse")
+async def parse_rubric_only(
+    rubric_pdf: UploadFile = File(...),
+):
+    """Parse a rubric PDF and return the extracted information without saving."""
+    pdf_data = await rubric_pdf.read()
+    if not pdf_data:
+        raise HTTPException(status_code=400, detail="Rubric PDF is empty.")
+
+    try:
+        pdf_text = pdf_bytes_to_text(pdf_data)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Unable to read PDF: {exc}") from exc
+
+    try:
+        rubric_payload = parse_rubric(pdf_text)
+    except RubricParsingError as exc:
+        raise HTTPException(status_code=503, detail=f"Rubric parsing failed: {exc}") from exc
+
+    # Generate prompts for preview
+    generated_prompts = []
+    for idx, criterion in enumerate(rubric_payload.get("criteria", []), start=1):
+        item_data = {
+            "name": criterion.get("name") or f"Criterion {idx}",
+            "description": criterion.get("description") or "",
+            "max_score": float(criterion.get("max_score") or 0.0) or 1.0,
+            "item_type": (criterion.get("item_type") or "criterion").strip().lower(),
+            "weight": float(criterion["weight"]) if criterion.get("weight") is not None else None,
+            "metadata": criterion.get("metadata") or {},
+        }
+        prompt_text = _build_item_prompt(item_data, "[Transcript will be inserted here]", rubric_payload.get("rubric_type") or "analytic")
+        generated_prompts.append({
+            "criterion_name": item_data["name"],
+            "prompt_text": prompt_text
+        })
+
+    return {
+        "rubric_title": rubric_payload["title"],
+        "rubric_type": rubric_payload.get("rubric_type") or "analytic",
+        "max_total_score": rubric_payload.get("max_total") or 0.0,
+        "items_extracted": len(rubric_payload.get("criteria", [])),
+        "criteria_names": [c.get("name") or f"Criterion {i+1}" for i, c in enumerate(rubric_payload.get("criteria", []))],
+        "generated_prompts": generated_prompts
+    }
+
+
+@app.post("/api/rubrics")
+def save_rubric(
+    rubric_data: dict,
+    db: Session = Depends(get_db),
+):
+    """Save a modified rubric to the database."""
+    try:
+        # Create rubric record
+        rubric = Rubric(
+            title=rubric_data.get("title", "Untitled Rubric"),
+            summary=rubric_data.get("summary", ""),
+            rubric_type=rubric_data.get("rubric_type", "analytic"),
+            max_total_score=rubric_data.get("max_total_score", 0.0),
+        )
+        db.add(rubric)
+        db.flush()
+
+        # Create rubric items
+        for order, criterion in enumerate(rubric_data.get("criteria", [])):
+            item = RubricItem(
+                rubric_id=rubric.id,
+                name=criterion.get("name", f"Criterion {order + 1}"),
+                description=criterion.get("description"),
+                item_type="criterion",
+                max_score=criterion.get("max_score", 10.0),
+                weight=criterion.get("weight"),
+                order_index=order,
+                metadata_json={},
+            )
+            db.add(item)
+
+        db.commit()
+        db.refresh(rubric)
+
+        return {"id": rubric.id, "message": "Rubric saved successfully"}
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to save rubric: {exc}") from exc
+
+
+@app.get("/api/rubrics")
+def list_rubrics(db: Session = Depends(get_db)):
+    """List all saved rubrics."""
+    rubrics = db.query(Rubric).order_by(Rubric.created_at.desc()).all()
+    return [
+        {
+            "id": rubric.id,
+            "title": rubric.title,
+            "rubric_type": rubric.rubric_type,
+            "max_total_score": rubric.max_total_score,
+            "items_count": len(rubric.items),
+            "created_at": rubric.created_at.isoformat(),
+        }
+        for rubric in rubrics
+    ]
+
+
+@app.delete("/api/rubrics/{rubric_id}")
+def delete_rubric(rubric_id: int, db: Session = Depends(get_db)):
+    """Delete a saved rubric."""
+    rubric = db.query(Rubric).filter(Rubric.id == rubric_id).first()
+    if not rubric:
+        raise HTTPException(status_code=404, detail="Rubric not found")
+
+    db.delete(rubric)
+    db.commit()
+    return {"message": "Rubric deleted successfully"}
+
+
+@app.post("/api/evaluations/with-rubric")
+async def create_evaluation_with_saved_rubric(
+    transcript_text: str = Form(...),
+    rubric_id: int = Form(...),
+    share_with_student: bool = Form(False),
+    student_identifier: str | None = Form(None),
+    grader_email: str | None = Form(None),
+    grader_name: str | None = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Create an evaluation using a pre-saved rubric."""
+    if not transcript_text.strip():
+        raise HTTPException(status_code=400, detail="Transcript text is required.")
+
+    # Load the rubric
+    rubric = db.query(Rubric).options(joinedload(Rubric.items)).filter(Rubric.id == rubric_id).first()
+    if not rubric:
+        raise HTTPException(status_code=404, detail="Rubric not found")
+
+    if not rubric.items:
+        raise HTTPException(status_code=400, detail="Rubric has no criteria")
+
+    # Prepare grader if provided
+    grader = None
+    normalized_email = grader_email.strip() if grader_email else None
+    if normalized_email:
+        grader = _get_or_create_user(
+            db,
+            email=normalized_email,
+            full_name=grader_name.strip() if grader_name else None,
+            role="faculty",
+        )
+
+    # Build scoring input
+    scoring_input: list[dict] = []
+    for item in rubric.items:
+        scoring_input.append(
+            {
+                "rubric_item_id": item.id,
+                "name": item.name,
+                "description": item.description,
+                "max_score": item.max_score or 10.0,
+                "item_type": item.item_type,
+                "weight": item.weight,
+                "metadata": item.metadata_dict,
+            }
+        )
+
+    # Score the transcript
+    try:
+        scoring = score_criteria(scoring_input, transcript_text, rubric_type=rubric.rubric_type)
+    except ScoringError as exc:
+        raise HTTPException(status_code=503, detail=f"Scoring failed: {exc}") from exc
+
+    # Create evaluation record
+    evaluation = Evaluation(
+        transcript_text=transcript_text,
+        rubric_title=rubric.title,
+        rubric_summary=rubric.summary,
+        feedback_summary=scoring["summary"],
+        total_score=scoring["total_score"],
+        max_total_score=scoring["max_total_score"],
+        performance_band=scoring["performance_band"],
+        share_with_student=share_with_student,
+        student_identifier=student_identifier.strip() if student_identifier else None,
+        grader=grader,
+        rubric=rubric,
+    )
+    db.add(evaluation)
+    db.flush()
+
+    # Save criterion scores
+    for item in scoring["criterion_scores"]:
+        db.add(
+            CriterionScore(
+                evaluation_id=evaluation.id,
+                rubric_item_id=item.get("rubric_item_id"),
+                name=item["name"],
+                description=item.get("description"),
+                score=item["score"],
+                max_score=item["max_score"],
+                feedback=item.get("feedback"),
+                evidence=item.get("evidence"),
+                justification=item.get("justification"),
+            )
+        )
+
+    db.commit()
+    db.refresh(evaluation)
+
+    return {"evaluation": evaluation, "message": "Evaluation created successfully"}
 
 
 def _parse_due_date(raw_value: str | None) -> datetime | None:
@@ -305,7 +513,31 @@ async def create_evaluation(
     db.commit()
     db.refresh(evaluation)
 
-    return EvaluationCreateResponse(evaluation=evaluation, message="Evaluation recorded.")
+    # Generate parsing info and prompts
+    generated_prompts = []
+    for item_data in scoring_input:
+        prompt_text = _build_item_prompt(item_data, transcript_text, rubric_record.rubric_type)
+        generated_prompts.append(
+            GeneratedPrompt(
+                criterion_name=item_data["name"],
+                prompt_text=prompt_text
+            )
+        )
+
+    parsing_info = RubricParsingInfo(
+        items_extracted=len(rubric_items),
+        rubric_title=rubric_payload["title"],
+        rubric_type=rubric_record.rubric_type,
+        max_total_score=rubric_record.max_total_score,
+        criteria_names=[item.name for item in rubric_items],
+        generated_prompts=generated_prompts
+    )
+
+    return EvaluationCreateResponse(
+        evaluation=evaluation,
+        message="Evaluation recorded.",
+        parsing_info=parsing_info
+    )
 
 
 @app.get("/api/evaluations", response_model=list[EvaluationListItem])

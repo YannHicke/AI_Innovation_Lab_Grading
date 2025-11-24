@@ -7,6 +7,7 @@ from io import BytesIO
 from typing import Any, Dict, List
 
 from openai import OpenAI
+from anthropic import Anthropic
 from pypdf import PdfReader
 
 from ..config import get_settings
@@ -61,34 +62,48 @@ class RubricParsingError(RuntimeError):
 
 @dataclass
 class LLMRubricParser:
-    """Wrapper around the OpenAI client for rubric extraction."""
+    """Wrapper around the LLM client for rubric extraction."""
 
-    client: OpenAI
+    client: Any  # OpenAI or Anthropic
     model: str
     temperature: float
     max_output_tokens: int
+    provider: str
 
     def parse(self, raw_text: str) -> Dict[str, Any]:
         if not raw_text or not raw_text.strip():
             raise RubricParsingError("Rubric text is empty.")
 
+        user_message = (
+            "Convert the following rubric into JSON. "
+            "Infer missing numeric maxima conservatively and never invent extra criteria.\n\n"
+            f"RUBRIC SOURCE:\n{raw_text.strip()}"
+        )
+
         try:
-            response = self.client.responses.create(
-                model=self.model,
-                instructions=SYSTEM_PROMPT,
-                input=(
-                    "Convert the following rubric into JSON. "
-                    "Infer missing numeric maxima conservatively and never invent extra criteria.\n\n"
-                    f"RUBRIC SOURCE:\n{raw_text.strip()}"
-                ),
-                temperature=self.temperature,
-                max_output_tokens=self.max_output_tokens,
-                text={"format": RUBRIC_TEXT_FORMAT},
-            )
+            if self.provider == "anthropic":
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=self.max_output_tokens,
+                    temperature=self.temperature,
+                    system=SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": user_message}],
+                )
+                payload = response.content[0].text
+            else:  # openai
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=self.temperature,
+                    max_tokens=self.max_output_tokens,
+                    response_format={"type": "json_object"}
+                )
+                payload = response.choices[0].message.content
         except Exception as exc:  # pragma: no cover - network failure pass-through
             raise RubricParsingError(f"LLM request failed: {exc}") from exc
-
-        payload = _extract_output_text(response)
 
         try:
             return _safe_json_loads(payload)
@@ -107,23 +122,31 @@ def pdf_bytes_to_text(data: bytes) -> str:
 @lru_cache()
 def _get_llm_parser() -> LLMRubricParser:
     settings = get_settings()
-    if settings.llm_provider != "openai":  # pragma: no cover - single provider guard
+
+    if settings.llm_provider not in ["openai", "anthropic"]:
         raise RubricParsingError(f"Unsupported LLM provider: {settings.llm_provider}")
-    if not settings.openai_api_key:
-        raise RubricParsingError("OpenAI API key is not configured (APP_OPENAI_API_KEY).")
+
     if not settings.llm_model:
         raise RubricParsingError("LLM model is not configured (APP_LLM_MODEL).")
 
-    client_kwargs: Dict[str, Any] = {"api_key": settings.openai_api_key}
-    if settings.llm_base_url:
-        client_kwargs["base_url"] = settings.llm_base_url
+    if settings.llm_provider == "anthropic":
+        if not settings.anthropic_api_key:
+            raise RubricParsingError("Anthropic API key is not configured (APP_ANTHROPIC_API_KEY).")
+        client = Anthropic(api_key=settings.anthropic_api_key)
+    else:  # openai
+        if not settings.openai_api_key:
+            raise RubricParsingError("OpenAI API key is not configured (APP_OPENAI_API_KEY).")
+        client_kwargs: Dict[str, Any] = {"api_key": settings.openai_api_key}
+        if settings.llm_base_url:
+            client_kwargs["base_url"] = settings.llm_base_url
+        client = OpenAI(**client_kwargs)
 
-    client = OpenAI(**client_kwargs)
     return LLMRubricParser(
         client=client,
         model=settings.llm_model,
         temperature=settings.llm_temperature,
         max_output_tokens=settings.llm_max_output_tokens,
+        provider=settings.llm_provider,
     )
 
 
@@ -155,7 +178,12 @@ def parse_rubric(raw_text: str) -> dict:
     for idx, item in enumerate(criteria_payload, start=1):
         name = (item.get("name") or f"Criterion {idx}").strip()
         description = (item.get("description") or "").strip() or None
-        max_score = _coerce_float(item.get("max_score"))
+        max_score_raw = item.get("max_score")
+        # For checklist items, max_score can be None; default to 1.0
+        if max_score_raw is None:
+            max_score = 1.0
+        else:
+            max_score = _coerce_float(max_score_raw)
         item_type = (item.get("item_type") or "criterion").strip().lower()
         weight_raw = item.get("weight")
         weight = _coerce_float(weight_raw) if weight_raw is not None else None
@@ -255,30 +283,6 @@ def _normalize_rubric_type(value: Any) -> str:
         if normalized in RUBRIC_TYPES:
             return normalized
     return "analytic"
-
-
-def _extract_output_text(response: Any) -> str:
-    direct = getattr(response, "output_text", None)
-    if direct:
-        return direct
-
-    output = getattr(response, "output", None) or []
-    fragments: List[str] = []
-    for block in output:
-        content = getattr(block, "content", None) or getattr(block, "output", None)
-        if not content:
-            continue
-        for item in content:
-            text = getattr(item, "text", None)
-            if text:
-                fragments.append(text)
-            elif isinstance(item, dict) and item.get("text"):
-                fragments.append(str(item["text"]))
-
-    if not fragments:
-        raise RubricParsingError("LLM response did not contain any text output.")
-
-    return "\n".join(fragments)
 
 
 def _safe_json_loads(payload: str) -> Dict[str, Any]:

@@ -13,10 +13,11 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
     ]
     share_results_default: bool = True
-    llm_provider: Literal["openai"] = "openai"
+    llm_provider: Literal["openai", "anthropic"] = "openai"
     llm_model: str = "gpt-4o-mini"
     llm_base_url: Optional[str] = None
     openai_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
     llm_temperature: float = 0.2
     llm_max_output_tokens: int = 6000
     log_level: str = "INFO"
