@@ -4,3 +4,4 @@ backend/app/__pycache__/
 backend/app/services/__pycache__/
 backend/grader.db
 backend/.env
+backend/app/routers/__pycache__/

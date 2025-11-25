@@ -30,6 +30,35 @@
   color: #475569;
 }
 
+.provider-controls {
+  margin: 1.5rem 0;
+  padding: 1rem 1.25rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #fff;
+  max-width: 360px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.provider-controls label {
+  font-weight: 600;
+  color: #334155;
+}
+
+.provider-hint {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #64748b;
+}
+
+.provider-note {
+  margin: 0 0 0.75rem;
+  font-size: 0.9rem;
+  color: #475569;
+}
+
 .metrics {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
@@ -428,6 +457,12 @@ button {
 
 .rubric-item:hover {
   background: #f8fafc;
+}
+
+.rubric-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
 }
 
 .rubric-title {

@@ -17,12 +17,17 @@ backend/
   app/
     config.py           # Pydantic settings pulled from environment variables
     database.py         # SQLAlchemy engine + session helpers
-    main.py             # FastAPI app and API routes
-    models.py           # Evaluation + CriterionScore ORM models
-    schemas.py          # Pydantic response models
+    main.py             # FastAPI app creation + router registration
+    models.py           # ORM models for users, assignments, rubrics, evaluations
+    schemas.py          # Pydantic request/response models
+    routers/
+      rubrics.py        # Rubric CRUD + parse endpoints
+      evaluations.py    # Evaluation creation + retrieval endpoints
     services/
       rubric_parser.py  # Extract rubric text from PDF
-      scoring.py        # Simple keyword-based scoring + summaries
+      scoring.py        # LLM-backed scoring + summaries
+      rubric_manager.py # Utilities to normalize rubric data
+      rubric_ops.py     # Assignment/user helpers and rubric persistence
   requirements.txt      # Backend dependencies
   .env.example          # Sample backend configuration
 frontend/
@@ -32,6 +37,13 @@ frontend/
   .env.example          # Sample frontend configuration
 .github/workflows/deploy-frontend.yml  # GitHub Pages workflow
 ```
+
+### Additional documentation
+
+- `docs/architecture.md` – System overview covering backend services, API contracts, and frontend workflows.
+- `docs/api.md` – Endpoint reference with request/response shapes.
+- `docs/frontend.md` – Component map, state flow, and configuration points.
+- `docs/dev-notes.md` – Local commands, coding conventions, and testing tips.
 
 ## Local development
 
@@ -60,9 +72,12 @@ Key environment variables (defined in `.env`):
 - `APP_ALLOWED_ORIGINS`: JSON list of URLs that may call the API (e.g. `["http://localhost:5173"]`).
 - `APP_SHARE_RESULTS_DEFAULT`: Optional boolean default for the UI toggle.
 - `APP_OPENAI_API_KEY`: Required. Used by the LLM-based rubric parser.
-- `APP_LLM_MODEL`: Defaults to `gpt-4o-mini`, override if you want to call a different OpenAI model.
+- `APP_ANTHROPIC_API_KEY`: Optional unless you switch the provider to Anthropic; required for Claude-based parsing/scoring.
+- `APP_LLM_MODEL_OPENAI`: Defaults to `gpt-4o-mini`. Override to call a different OpenAI model.
+- `APP_LLM_MODEL_ANTHROPIC`: Defaults to `claude-sonnet-4-5` (Anthropic’s structured-output-capable Sonnet). Override if you use a different Claude model.
+- `APP_LLM_MODEL`: Optional global override applied to both providers (kept for backward compatibility).
 - `APP_LLM_BASE_URL`: Optional override if you're routing through a proxy or Azure endpoint.
-- `APP_LLM_TEMPERATURE` / `APP_LLM_MAX_OUTPUT_TOKENS`: Advanced controls for prompt behavior.
+- `APP_LLM_TEMPERATURE` / `APP_LLM_MAX_OUTPUT_TOKENS`: Advanced controls for prompt behavior. For large PDFs with Anthropic structured outputs, keep `APP_LLM_MAX_OUTPUT_TOKENS` at ~12000 to avoid `stop_reason=max_tokens` truncation.
 
 ### Frontend
 
@@ -78,10 +93,17 @@ npm run dev
 
 ### Quick API overview
 
+- `GET /api/health`: Liveness probe for Render.
+- `POST /api/rubrics/parse`: Upload a PDF to extract rubric JSON (not stored).
+- `POST /api/rubrics`: Save a rubric (JSON payload).
+- `PUT /api/rubrics/{id}`: Update a saved rubric and replace its criteria.
+- `GET /api/rubrics`: List saved rubrics (id, title, items_count, etc.).
+- `GET /api/rubrics/{id}`: Fetch a rubric with criteria and levels.
+- `DELETE /api/rubrics/{id}`: Remove a rubric.
 - `POST /api/evaluations`: multipart form (transcript text + rubric PDF + optional `share_with_student`). Returns stored evaluation with per-criterion scores and generated feedback.
+- `POST /api/evaluations/with-rubric`: Evaluate a transcript against a saved rubric by id.
 - `GET /api/evaluations`: Paginated list of recent evaluations (defaults to 10, max 50).
 - `GET /api/evaluations/{id}`: Full evaluation payload including criterion breakdown.
-- `GET /api/health`: Liveness probe for Render.
 
 ## Render deployment guide
 
