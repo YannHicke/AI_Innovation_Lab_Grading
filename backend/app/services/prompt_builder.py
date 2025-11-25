@@ -30,6 +30,7 @@ def build_item_prompt(item: Dict[str, Any], transcript_text: str, rubric_type: s
         "- Do not reference any other criteria.",
         "- Do not invent or assume transcript content.",
         "- Evidence must be a verbatim quotation from the transcript.",
+        "- Provide actionable suggestions for improvement.",
         "",
         f"Rubric item: {item['name']}",
         f"Description: {description}",
@@ -49,7 +50,7 @@ def build_item_prompt(item: Dict[str, Any], transcript_text: str, rubric_type: s
             lines.append(f"- Score {score_value}: {detail} ({label})")
 
     lines.append(
-        "\nReturn ONLY JSON with the keys 'evaluation' -> {'score': number, 'justification': string}."
+        "\nReturn ONLY JSON with the keys 'evaluation' -> {'score': number, 'justification': string, 'evidence': string, 'actionable suggestions': string}."
     )
     lines.append("\nTranscript:\n" + transcript_text.strip())
     return "\n".join(lines)

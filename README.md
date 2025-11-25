@@ -58,6 +58,7 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env  # tweak APP_DATABASE_URL if needed
+alembic upgrade head  # apply migrations / create schema
 uvicorn app.main:app --reload --port 8000
 ```
 

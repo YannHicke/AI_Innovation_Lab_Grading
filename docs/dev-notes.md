@@ -20,3 +20,9 @@
 ## Testing / verification
 - Backend: run the FastAPI app and hit `/api/health`; exercise `/api/rubrics/parse` with a small PDF when changing parser code.
 - Frontend: `npm run build` should stay green; spot-check rubric upload/edit and evaluation flows in the UI.
+
+## Database migrations
+- Alembic is initialized under `backend/migrations/` with a baseline revision (`93b05b7e37da`).
+- Apply migrations (or create the schema) with `cd backend && source .venv/bin/activate && alembic upgrade head`.
+- When changing `app/models.py`, run `alembic revision --autogenerate -m "short message"` and review the generated diff before committing.
+- Existing SQLite/Postgres databases created via `ensure_schema()` can be stamped with `alembic stamp head` to skip re-creation.
