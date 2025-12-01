@@ -10,6 +10,14 @@ from openai import OpenAI
 from anthropic import Anthropic
 
 from ..config import get_settings
+from .prompt_builder import build_item_prompt
+from .llm_utils import (
+    ANTHROPIC_STRUCTURED_OUTPUTS_BETA,
+    anthropic_message_call,
+    extract_message_payload,
+    parse_llm_json,
+    resolve_model_for_provider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,24 +29,29 @@ ITEM_SYSTEM_PROMPT = (
     "quote the transcript directly, and return JSON with a numeric score and justification."
 )
 
-SCORING_ITEM_FORMAT: Dict[str, Any] = {
+SCORING_ITEM_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "evaluation": {
+            "type": "object",
+            "properties": {
+                "score": {"type": "number"},
+                "justification": {"type": "string"},
+            },
+            "required": ["score", "justification"],
+            "additionalProperties": False,
+        }
+    },
+    "required": ["evaluation"],
+    "additionalProperties": False,
+}
+
+OPENAI_SCORING_RESPONSE_FORMAT: Dict[str, Any] = {
     "type": "json_schema",
-    "name": "single_rubric_item_scoring",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "evaluation": {
-                "type": "object",
-                "properties": {
-                    "score": {"type": "number"},
-                    "justification": {"type": "string"},
-                },
-                "required": ["score", "justification"],
-                "additionalProperties": False,
-            }
-        },
-        "required": ["evaluation"],
-        "additionalProperties": False,
+    "json_schema": {
+        "name": "single_rubric_item_scoring",
+        "strict": True,
+        "schema": SCORING_ITEM_SCHEMA,
     },
 }
 
@@ -59,12 +72,15 @@ class LLMScoringClient:
         logger.debug("LLM scoring prompt input: %s", prompt[:2000])
         try:
             if self.provider == "anthropic":
-                response = self.client.messages.create(
+                response = anthropic_message_call(
+                    self.client,
                     model=self.model,
                     max_tokens=self.max_output_tokens,
                     temperature=self.temperature,
                     system=ITEM_SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": prompt}],
+                    betas=[ANTHROPIC_STRUCTURED_OUTPUTS_BETA],
+                    output_format={"type": "json_schema", "schema": SCORING_ITEM_SCHEMA},
                 )
                 payload = response.content[0].text
                 logger.info(
@@ -81,9 +97,16 @@ class LLMScoringClient:
                     ],
                     temperature=self.temperature,
                     max_tokens=self.max_output_tokens,
-                    response_format={"type": "json_object"}
+                    response_format=OPENAI_SCORING_RESPONSE_FORMAT,
                 )
-                payload = response.choices[0].message.content
+                message = response.choices[0].message
+                refusal = getattr(message, "refusal", None)
+                if refusal:
+                    raise ScoringError(f"LLM refused to score criterion: {refusal}")
+                parsed_field = getattr(message, "parsed", None)
+                if isinstance(parsed_field, (dict, list)):
+                    return parsed_field
+                payload = extract_message_payload(message)
                 logger.info(
                     "LLM scoring response for prompt hash=%s: usage=%s",
                     hash(prompt),
@@ -93,12 +116,17 @@ class LLMScoringClient:
             raise ScoringError(f"LLM scoring request failed: {exc}") from exc
 
         try:
-            return json.loads(payload)
+            return parse_llm_json(payload)
         except json.JSONDecodeError as exc:  # pragma: no cover - defensive guard
             raise ScoringError(f"LLM scoring returned invalid JSON: {exc}") from exc
 
 
-def score_criteria(criteria: List[dict], transcript_text: str, rubric_type: str = DEFAULT_RUBRIC_TYPE) -> dict:
+def score_criteria(
+    criteria: List[dict],
+    transcript_text: str,
+    rubric_type: str = DEFAULT_RUBRIC_TYPE,
+    provider: str | None = None,
+) -> dict:
     if not criteria:
         raise ScoringError("At least one rubric criterion is required for scoring.")
     if not transcript_text or not transcript_text.strip():
@@ -117,10 +145,10 @@ def score_criteria(criteria: List[dict], transcript_text: str, rubric_type: str 
         }
         rubric_payload.append(payload_item)
 
-    scorer = _get_llm_scorer()
+    scorer = _get_llm_scorer(provider)
     normalized_scores: List[Dict[str, Any]] = []
     for item in rubric_payload:
-        prompt = _build_item_prompt(item, transcript_text, rubric_type or DEFAULT_RUBRIC_TYPE)
+        prompt = build_item_prompt(item, transcript_text, rubric_type or DEFAULT_RUBRIC_TYPE)
         logger.info("Scoring prompt for item %s (%s): %s", item["rubric_item_id"], item["name"], prompt)
         result = scorer.score_item(prompt=prompt)
         evaluation = result.get("evaluation") or result
@@ -199,17 +227,22 @@ def performance_band(percent: float) -> str:
     return "Needs Support"
 
 
+def _get_llm_scorer(provider_override: str | None) -> LLMScoringClient:
+    provider = _normalize_provider(provider_override)
+    return _build_llm_scorer(provider)
+
+
 @lru_cache()
-def _get_llm_scorer() -> LLMScoringClient:
+def _build_llm_scorer(provider: str) -> LLMScoringClient:
     settings = get_settings()
 
-    if settings.llm_provider not in ["openai", "anthropic"]:
-        raise ScoringError(f"Unsupported LLM provider: {settings.llm_provider}")
+    model = resolve_model_for_provider(settings, provider)
+    if not model:
+        raise ScoringError(
+            "LLM model is not configured (set APP_LLM_MODEL or provider-specific APP_LLM_MODEL_OPENAI / APP_LLM_MODEL_ANTHROPIC)."
+        )
 
-    if not settings.llm_model:
-        raise ScoringError("LLM model is not configured (APP_LLM_MODEL).")
-
-    if settings.llm_provider == "anthropic":
+    if provider == "anthropic":
         if not settings.anthropic_api_key:
             raise ScoringError("Anthropic API key is not configured (APP_ANTHROPIC_API_KEY).")
         client = Anthropic(api_key=settings.anthropic_api_key)
@@ -223,10 +256,10 @@ def _get_llm_scorer() -> LLMScoringClient:
 
     return LLMScoringClient(
         client=client,
-        model=settings.llm_model,
+        model=model,
         temperature=settings.llm_temperature,
         max_output_tokens=settings.llm_max_output_tokens,
-        provider=settings.llm_provider,
+        provider=provider,
     )
 
 

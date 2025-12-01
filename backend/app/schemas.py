@@ -79,6 +79,32 @@ class EvaluationListItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class RubricCriterionPreview(BaseModel):
+    name: str
+    description: Optional[str] = None
+    item_type: str = "criterion"
+    max_score: float
+    weight: Optional[float] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RubricCriterionInput(BaseModel):
+    name: str
+    description: Optional[str] = None
+    item_type: str = "criterion"
+    max_score: Optional[float] = None
+    weight: Optional[float] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RubricSaveRequest(BaseModel):
+    title: str
+    summary: Optional[str] = None
+    rubric_type: str = "analytic"
+    max_total_score: float = 0.0
+    criteria: List[RubricCriterionInput] = Field(default_factory=list, min_items=1)
+
+
 class GeneratedPrompt(BaseModel):
     criterion_name: str
     prompt_text: str
@@ -90,6 +116,7 @@ class RubricParsingInfo(BaseModel):
     rubric_type: str
     max_total_score: float
     criteria_names: List[str]
+    criteria: List[RubricCriterionPreview]
     generated_prompts: List[GeneratedPrompt]
 
 

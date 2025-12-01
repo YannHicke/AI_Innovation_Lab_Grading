@@ -6,11 +6,22 @@ from functools import lru_cache
 from io import BytesIO
 from typing import Any, Dict, List
 
+import logging
 from openai import OpenAI
 from anthropic import Anthropic
 from pypdf import PdfReader
 
 from ..config import get_settings
+from .llm_utils import (
+    resolve_model_for_provider,
+    ANTHROPIC_STRUCTURED_OUTPUTS_BETA,
+    anthropic_message_call,
+    extract_message_payload,
+    parse_llm_json,
+)
+from .prompt_builder import PROMPT_PLACEHOLDER, build_item_prompt
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = (
@@ -21,37 +32,91 @@ SYSTEM_PROMPT = (
 
 RUBRIC_TYPES = ["analytic", "holistic", "single_point", "checklist", "hybrid"]
 
-RUBRIC_TEXT_FORMAT: Dict[str, Any] = {
-    "type": "json_schema",
-    "name": "rubric_extraction",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "rubric_title": {"type": "string"},
-            "rubric_summary": {"type": "string"},
-            "max_total_score": {"type": "number"},
-            "rubric_type": {"type": "string", "enum": RUBRIC_TYPES},
-            "criteria": {
-                "type": "array",
-                "minItems": 1,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "description": {"type": ["string", "null"]},
-                        "max_score": {"type": "number"},
+RUBRIC_TEXT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "rubric_title": {"type": "string"},
+        "rubric_summary": {"type": "string"},
+        "max_total_score": {"type": "number"},
+        "rubric_type": {"type": "string", "enum": RUBRIC_TYPES},
+        "criteria": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": ["string", "null"]},
+                    "max_score": {"type": "number"},
+                    "item_type": {"type": ["string", "null"]},
+                    "weight": {"type": ["number", "null"]},
+                    "metadata": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "performance_levels": {
+                                "type": ["array", "null"],
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": ["string", "null"]},
+                                        "description": {"type": ["string", "null"]},
+                                        "score": {"type": ["number", "null"]},
+                                    },
+                                    "required": ["label", "description", "score"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "checklist_required": {"type": ["boolean", "null"]},
+                            "single_point": {
+                                "type": ["object", "null"],
+                                "properties": {
+                                    "target_description": {"type": ["string", "null"]},
+                                    "exceeds_description": {"type": ["string", "null"]},
+                                    "below_description": {"type": ["string", "null"]},
+                                },
+                                "required": [
+                                    "target_description",
+                                    "exceeds_description",
+                                    "below_description",
+                                ],
+                                "additionalProperties": False,
+                            },
+                            "keywords": {
+                                "type": ["array", "null"],
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": [
+                            "performance_levels",
+                            "checklist_required",
+                            "single_point",
+                            "keywords",
+                        ],
+                        "additionalProperties": False,
                     },
-                    "required": [
-                        "name",
-                        "description",
-                        "max_score",
-                    ],
-                    "additionalProperties": False,
                 },
+                "required": [
+                    "name",
+                    "description",
+                    "max_score",
+                    "item_type",
+                    "weight",
+                    "metadata",
+                ],
+                "additionalProperties": False,
             },
         },
-        "required": ["rubric_title", "rubric_summary", "max_total_score", "rubric_type", "criteria"],
-        "additionalProperties": False,
+    },
+    "required": ["rubric_title", "rubric_summary", "max_total_score", "rubric_type", "criteria"],
+    "additionalProperties": False,
+}
+
+OPENAI_RUBRIC_RESPONSE_FORMAT: Dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "rubric_extraction",
+        "strict": True,
+        "schema": RUBRIC_TEXT_SCHEMA,
     },
 }
 
@@ -82,14 +147,22 @@ class LLMRubricParser:
 
         try:
             if self.provider == "anthropic":
-                response = self.client.messages.create(
+                response = anthropic_message_call(
+                    self.client,
                     model=self.model,
                     max_tokens=self.max_output_tokens,
                     temperature=self.temperature,
                     system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": user_message}],
+                    betas=[ANTHROPIC_STRUCTURED_OUTPUTS_BETA],
+                    output_format={"type": "json_schema", "schema": RUBRIC_TEXT_SCHEMA},
                 )
-                payload = response.content[0].text
+                stop_reason = getattr(response, "stop_reason", None)
+                if stop_reason == "max_tokens":
+                    raise RubricParsingError(
+                        f"LLM response truncated (stop_reason=max_tokens). Increase APP_LLM_MAX_OUTPUT_TOKENS (current {self.max_output_tokens})."
+                    )
+                payload = response.content[0].text if response.content else response
             else:  # openai
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -99,15 +172,37 @@ class LLMRubricParser:
                     ],
                     temperature=self.temperature,
                     max_tokens=self.max_output_tokens,
-                    response_format={"type": "json_object"}
+                    response_format=OPENAI_RUBRIC_RESPONSE_FORMAT,
                 )
-                payload = response.choices[0].message.content
+                message = response.choices[0].message
+                refusal = getattr(message, "refusal", None)
+                if refusal:
+                    raise RubricParsingError(f"LLM refused to parse rubric: {refusal}")
+                # If the SDK already parsed JSON for us, return it directly.
+                parsed_field = getattr(message, "parsed", None)
+                if isinstance(parsed_field, (dict, list)):
+                    return parsed_field
+                try:
+                    finish_reason = response.choices[0].finish_reason
+                except Exception:
+                    finish_reason = None
+                logger.info("Rubric parse finish_reason=%s usage=%s", finish_reason, getattr(response, "usage", None))
+                if finish_reason == "length":
+                    raise RubricParsingError(
+                        f"LLM response truncated (finish_reason=length). Increase APP_LLM_MAX_OUTPUT_TOKENS (current {self.max_output_tokens})."
+                    )
+                payload = extract_message_payload(message)
         except Exception as exc:  # pragma: no cover - network failure pass-through
             raise RubricParsingError(f"LLM request failed: {exc}") from exc
 
+        if payload in (None, "", []):
+            raise RubricParsingError("LLM returned an empty response.")
+
         try:
-            return _safe_json_loads(payload)
+            return parse_llm_json(payload)
         except json.JSONDecodeError as exc:  # pragma: no cover - defensive guard
+            snippet = str(payload)[:500] if payload is not None else "<empty payload>"
+            logger.error("Failed to decode LLM JSON; payload snippet: %s", snippet)
             raise RubricParsingError(f"LLM returned invalid JSON: {exc}") from exc
 
 
@@ -119,17 +214,22 @@ def pdf_bytes_to_text(data: bytes) -> str:
     return "\n".join(contents)
 
 
+def _get_llm_parser(provider_override: str | None) -> LLMRubricParser:
+    provider = _normalize_provider(provider_override)
+    return _build_llm_parser(provider)
+
+
 @lru_cache()
-def _get_llm_parser() -> LLMRubricParser:
+def _build_llm_parser(provider: str) -> LLMRubricParser:
     settings = get_settings()
 
-    if settings.llm_provider not in ["openai", "anthropic"]:
-        raise RubricParsingError(f"Unsupported LLM provider: {settings.llm_provider}")
+    model = resolve_model_for_provider(settings, provider)
+    if not model:
+        raise RubricParsingError(
+            "LLM model is not configured (set APP_LLM_MODEL or provider-specific APP_LLM_MODEL_OPENAI / APP_LLM_MODEL_ANTHROPIC)."
+        )
 
-    if not settings.llm_model:
-        raise RubricParsingError("LLM model is not configured (APP_LLM_MODEL).")
-
-    if settings.llm_provider == "anthropic":
+    if provider == "anthropic":
         if not settings.anthropic_api_key:
             raise RubricParsingError("Anthropic API key is not configured (APP_ANTHROPIC_API_KEY).")
         client = Anthropic(api_key=settings.anthropic_api_key)
@@ -143,10 +243,10 @@ def _get_llm_parser() -> LLMRubricParser:
 
     return LLMRubricParser(
         client=client,
-        model=settings.llm_model,
+        model=model,
         temperature=settings.llm_temperature,
         max_output_tokens=settings.llm_max_output_tokens,
-        provider=settings.llm_provider,
+        provider=provider,
     )
 
 
@@ -161,13 +261,13 @@ def _coerce_float(value: Any) -> float:
     raise RubricParsingError(f"Expected numeric value, received: {value}")
 
 
-def parse_rubric(raw_text: str) -> dict:
+def parse_rubric(raw_text: str, provider: str | None = None) -> dict:
     """Use an LLM to transform rubric text into structured JSON."""
 
-    llm_parser = _get_llm_parser()
+    llm_parser = _get_llm_parser(provider)
     result = llm_parser.parse(raw_text)
 
-    criteria_payload: List[Dict[str, Any]] = result.get("criteria") or []
+    criteria_payload = _resolve_criteria_payload(result)
     if not criteria_payload:
         raise RubricParsingError("LLM response did not include any criteria.")
 
@@ -187,36 +287,66 @@ def parse_rubric(raw_text: str) -> dict:
         item_type = (item.get("item_type") or "criterion").strip().lower()
         weight_raw = item.get("weight")
         weight = _coerce_float(weight_raw) if weight_raw is not None else None
+        metadata_payload = item.get("metadata")
+        if not isinstance(metadata_payload, dict):
+            metadata_payload = {}
+
         metadata: Dict[str, Any] = {}
-        keywords = _clean_keywords(item.get("keywords"))
+        keywords_source = metadata_payload.get("keywords")
+        if keywords_source is None:
+            keywords_source = item.get("keywords")
+        keywords = _clean_keywords(keywords_source)
         if keywords:
             metadata["keywords"] = keywords
+        single_point_source = metadata_payload.get("single_point")
+        if not isinstance(single_point_source, dict):
+            single_point_source = {}
         single_point = {
-            "target_description": _clean_text(item.get("target_description")),
-            "exceeds_description": _clean_text(item.get("exceeds_description")),
-            "below_description": _clean_text(item.get("below_description")),
+            "target_description": _clean_text(
+                single_point_source.get("target_description") or item.get("target_description")
+            ),
+            "exceeds_description": _clean_text(
+                single_point_source.get("exceeds_description") or item.get("exceeds_description")
+            ),
+            "below_description": _clean_text(
+                single_point_source.get("below_description") or item.get("below_description")
+            ),
         }
         if any(single_point.values()):
             metadata["single_point"] = single_point
+        checklist_required = metadata_payload.get("checklist_required")
+        if checklist_required is None:
+            checklist_required = item.get("checklist_required", False)
         if item_type == "checklist" or rubric_type == "checklist":
-            metadata["checklist_required"] = bool(item.get("checklist_required", False))
-        perf_levels = _normalize_levels(item.get("performance_levels") or [], prefix=f"{name.lower().replace(' ', '_')}_level")
+            metadata["checklist_required"] = bool(checklist_required)
+        perf_source = metadata_payload.get("performance_levels")
+        if perf_source is None:
+            perf_source = item.get("performance_levels")
+        if not isinstance(perf_source, list):
+            perf_source = []
+        perf_levels = _normalize_levels(
+            perf_source, prefix=f"{name.lower().replace(' ', '_')}_level"
+        )
         if perf_levels:
             metadata["performance_levels"] = perf_levels
 
-        criteria.append(
-            {
-                "name": name,
-                "description": description,
-                "max_score": max_score,
-                "item_type": item_type,
-                "weight": weight,
-                "metadata": metadata,
-            }
-        )
+        criterion_payload = {
+            "name": name,
+            "description": description,
+            "max_score": max_score,
+            "item_type": item_type,
+            "weight": weight,
+            "metadata": metadata,
+        }
+        prompt_text = build_item_prompt(criterion_payload, PROMPT_PLACEHOLDER, rubric_type)
+        metadata["prompt_template"] = prompt_text
+        if not criterion_payload["description"]:
+            criterion_payload["description"] = prompt_text
+
+        criteria.append(criterion_payload)
 
     declared_total = result.get("max_total_score")
-    max_total = _coerce_float(declared_total) if declared_total is not None else sum(c["max_score"] for c in criteria)
+    max_total_score = _coerce_float(declared_total) if declared_total is not None else sum(c["max_score"] for c in criteria)
 
     summary_source = (result.get("rubric_summary") or "").strip()
     if not summary_source:
@@ -228,7 +358,7 @@ def parse_rubric(raw_text: str) -> dict:
         "title": title or "Uploaded Rubric",
         "summary": summary_source[:400],
         "criteria": criteria,
-        "max_total": max_total,
+        "max_total_score": max_total_score,
         "rubric_type": rubric_type,
         "levels": levels,
     }
@@ -285,17 +415,39 @@ def _normalize_rubric_type(value: Any) -> str:
     return "analytic"
 
 
-def _safe_json_loads(payload: str) -> Dict[str, Any]:
-    try:
-        return json.loads(payload)
-    except json.JSONDecodeError:
-        trimmed = payload.strip()
-        if trimmed.startswith("```") and trimmed.endswith("```"):
-            inner = trimmed.strip("` \n")
-            return json.loads(inner)
-        start = trimmed.find("{")
-        end = trimmed.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidate = trimmed[start : end + 1]
-            return json.loads(candidate)
-        raise
+def _resolve_criteria_payload(result: Any) -> List[Dict[str, Any]]:
+    """Handle multiple possible schema variants returned by the LLM."""
+
+    if isinstance(result, list):
+        return [entry for entry in result if isinstance(entry, dict)]
+
+    if not isinstance(result, dict):
+        return []
+
+    candidate_keys = [
+        "criteria",
+        "rubric_items",
+        "items",
+        "rubricCriteria",
+        "rubric_items_list",
+    ]
+
+    for key in candidate_keys:
+        payload = result.get(key)
+        if isinstance(payload, list):
+            return [entry for entry in payload if isinstance(entry, dict)]
+
+    # Sometimes the model nests the rubric inside another key
+    nested = result.get("rubric") or result.get("data")
+    if isinstance(nested, dict):
+        return _resolve_criteria_payload(nested)
+
+    return []
+
+
+def _normalize_provider(provider_override: str | None) -> str:
+    settings = get_settings()
+    candidate = (provider_override or settings.llm_provider or "").strip().lower()
+    if candidate not in {"openai", "anthropic"}:
+        raise RubricParsingError(f"Unsupported LLM provider: {candidate or 'unset'}")
+    return candidate
