@@ -242,13 +242,11 @@ def _build_item_prompt(item: Dict[str, Any], transcript_text: str, rubric_type: 
         "",
         "A cleaned transcript.",
         "",
-        "Your tasks:",
-        "Score only this specific criterion at a time before moving to the next.",
-        "",
         "Provide:",
         "- The numeric score.",
         "- A brief justification (1–2 sentences).",
         "- Evidence taken directly from the transcript as an exact quote.",
+        # // is this too difficult for an llm to do all at once, or is it okay
         "",
         "Rules:",
         "- Do not reference any other criteria.",
@@ -275,5 +273,6 @@ def _build_item_prompt(item: Dict[str, Any], transcript_text: str, rubric_type: 
     lines.append(
         "\nReturn ONLY JSON with the keys 'evaluation' -> {'score': number, 'justification': string}."
     )
+    # handle any accomodation of those like in the dashboard timmy wants about student growth maybe in this area ere of outputting score justification and evidecne
     lines.append("\nTranscript:\n" + transcript_text.strip())
     return "\n".join(lines)
