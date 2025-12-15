@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 
 from ..config import get_settings
@@ -18,7 +19,8 @@ from ..services.rubric_ops import (
     persist_rubric,
 )
 from ..services.rubric_parser import RubricParsingError, parse_rubric, pdf_bytes_to_text
-from ..services.scoring import ScoringError, score_criteria
+from ..services.scoring import ScoringError, score_criteria, score_criteria_parallel
+from ..services.pdf_generator import generate_evaluation_pdf
 
 router = APIRouter(prefix="/api/evaluations", tags=["evaluations"])
 settings = get_settings()
@@ -65,11 +67,13 @@ async def create_evaluation_with_saved_rubric(
     scoring_input = scoring_payload_from_models(rubric.items, fallback_max)
 
     try:
-        scoring = score_criteria(
+        # Use parallel scoring for better performance
+        scoring = await score_criteria_parallel(
             scoring_input,
             transcript_text,
             rubric_type=rubric.rubric_type,
             provider=llm_provider,
+            batch_size=10,  # Process 10 items concurrently
         )
     except ScoringError as exc:
         raise HTTPException(status_code=503, detail=f"Scoring failed: {exc}") from exc
@@ -190,11 +194,13 @@ async def create_evaluation(
     scoring_input = scoring_payload_from_models(rubric_items, fallback_max)
 
     try:
-        scoring = score_criteria(
+        # Use parallel scoring for better performance
+        scoring = await score_criteria_parallel(
             scoring_input,
             transcript_text,
             rubric_type=rubric_record.rubric_type,
             provider=llm_provider,
+            batch_size=10,  # Process 10 items concurrently
         )
     except ScoringError as exc:
         raise HTTPException(status_code=503, detail=f"Scoring failed: {exc}") from exc
@@ -282,3 +288,189 @@ def get_evaluation(evaluation_id: int, db: Session = Depends(get_db)):
     if not evaluation:
         raise HTTPException(status_code=404, detail="Evaluation not found")
     return evaluation
+
+
+@router.put("/{evaluation_id}")
+def update_evaluation(
+    evaluation_id: int,
+    update_data: dict,
+    db: Session = Depends(get_db),
+):
+    """Update an evaluation's scores and title."""
+    evaluation = db.query(Evaluation).filter(Evaluation.id == evaluation_id).first()
+    if not evaluation:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+
+    try:
+        # Update rubric title
+        if 'rubric_title' in update_data:
+            evaluation.rubric_title = update_data['rubric_title']
+
+        # Update total score
+        if 'total_score' in update_data:
+            evaluation.total_score = update_data['total_score']
+
+        # Update criterion scores
+        if 'criterion_scores' in update_data:
+            for score_update in update_data['criterion_scores']:
+                criterion_score = (
+                    db.query(CriterionScore)
+                    .filter(CriterionScore.id == score_update['id'])
+                    .first()
+                )
+                if criterion_score:
+                    criterion_score.score = score_update['score']
+                    if 'feedback' in score_update:
+                        criterion_score.feedback = score_update['feedback']
+
+        db.commit()
+        db.refresh(evaluation)
+
+        return {"message": "Evaluation updated successfully", "evaluation": evaluation}
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update evaluation: {exc}") from exc
+
+
+@router.post("/{evaluation_id}/learner-report")
+async def generate_learner_report(
+    evaluation_id: int,
+    request_data: dict,
+    db: Session = Depends(get_db),
+):
+    """Generate a student learner report with strengths, growth opportunities, and actionable suggestions."""
+    # Fetch evaluation with all related data
+    evaluation = (
+        db.query(Evaluation)
+        .options(
+            joinedload(Evaluation.criterion_scores),
+        )
+        .filter(Evaluation.id == evaluation_id)
+        .first()
+    )
+
+    if not evaluation:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+
+    llm_provider = request_data.get('llm_provider', 'anthropic')
+
+    # Build prompt for learner report generation
+    criterion_details = "\n".join([
+        f"- {cs.name}: {cs.score}/{cs.max_score} - {cs.feedback}"
+        for cs in evaluation.criterion_scores
+    ])
+
+    system_prompt = """You are an educational feedback specialist. Generate a comprehensive student learner report based on the evaluation results.
+
+Your response must be valid JSON with this exact structure:
+{
+  "top_strengths": ["strength 1", "strength 2", "strength 3"],
+  "growth_opportunities": ["opportunity 1", "opportunity 2", "opportunity 3"],
+  "actionable_suggestions": ["suggestion 1", "suggestion 2", "suggestion 3"]
+}
+
+Guidelines:
+- Top Strengths: Identify 3 specific areas where the student excelled
+- Growth Opportunities: Identify 3 areas where improvement would be beneficial (phrase positively)
+- Actionable Suggestions: Provide 3 concrete, specific actions the student can take to improve
+
+Be encouraging, specific, and constructive."""
+
+    user_prompt = f"""Generate a learner report for this evaluation:
+
+Rubric: {evaluation.rubric_title}
+Performance Band: {evaluation.performance_band}
+Total Score: {evaluation.total_score}/{evaluation.max_total_score}
+Overall Feedback: {evaluation.feedback_summary}
+
+Criterion Scores:
+{criterion_details}
+
+Transcript Text:
+{evaluation.transcript_text[:2000]}
+
+Generate the learner report as JSON."""
+
+    try:
+        from ..services.llm_utils import call_llm
+
+        response_text = await call_llm(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            provider=llm_provider,
+            temperature=0.7,
+        )
+
+        # Parse JSON response
+        import json
+        learner_report = json.loads(response_text)
+
+        # Validate structure
+        if not all(key in learner_report for key in ['top_strengths', 'growth_opportunities', 'actionable_suggestions']):
+            raise ValueError("Invalid learner report structure")
+
+        return learner_report
+
+    except json.JSONDecodeError as exc:
+        logger.error(f"Failed to parse learner report JSON: {exc}")
+        raise HTTPException(status_code=503, detail="Failed to generate learner report - invalid JSON response") from exc
+    except Exception as exc:
+        logger.error(f"Error generating learner report: {exc}")
+        raise HTTPException(status_code=503, detail=f"Failed to generate learner report: {exc}") from exc
+
+
+@router.get("/{evaluation_id}/pdf")
+def download_evaluation_pdf(evaluation_id: int, db: Session = Depends(get_db)):
+    """Generate and download a PDF report for an evaluation."""
+    # Fetch evaluation with all related data
+    evaluation = (
+        db.query(Evaluation)
+        .options(
+            joinedload(Evaluation.criterion_scores),
+        )
+        .filter(Evaluation.id == evaluation_id)
+        .first()
+    )
+
+    if not evaluation:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+
+    # Convert evaluation to dict for PDF generation
+    evaluation_dict = {
+        "id": evaluation.id,
+        "rubric_title": evaluation.rubric_title,
+        "created_at": evaluation.created_at.isoformat(),
+        "performance_band": evaluation.performance_band,
+        "total_score": evaluation.total_score,
+        "max_total_score": evaluation.max_total_score,
+        "feedback_summary": evaluation.feedback_summary,
+        "key_strengths": evaluation.key_strengths or [],
+        "areas_for_development": evaluation.areas_for_development or [],
+        "criterion_scores": [
+            {
+                "id": cs.id,
+                "name": cs.name,
+                "description": cs.description,
+                "score": cs.score,
+                "max_score": cs.max_score,
+                "feedback": cs.feedback,
+            }
+            for cs in evaluation.criterion_scores
+        ],
+    }
+
+    # Generate PDF
+    pdf_buffer = generate_evaluation_pdf(evaluation_dict)
+
+    # Create filename
+    safe_title = "".join(c for c in evaluation.rubric_title if c.isalnum() or c in (' ', '-', '_')).strip()
+    filename = f"evaluation_{evaluation_id}_{safe_title[:30]}.pdf"
+
+    # Return as downloadable file
+    return StreamingResponse(
+        pdf_buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        }
+    )

@@ -1,0 +1,659 @@
+import { useEffect, useState } from 'react'
+
+import './App.css'
+import { API_BASE_URL, PROVIDER_OPTIONS } from './config'
+
+function App() {
+  const [currentStep, setCurrentStep] = useState(1)
+  const [rubricText, setRubricText] = useState('')
+  const [transcriptFile, setTranscriptFile] = useState(null)
+  const [transcriptText, setTranscriptText] = useState('')
+  const [parsedRubric, setParsedRubric] = useState(null)
+  const [savedRubricId, setSavedRubricId] = useState(null)
+  const [evaluation, setEvaluation] = useState(null)
+  const [history, setHistory] = useState([])
+  const [llmProvider, setLlmProvider] = useState('openai')
+  const [status, setStatus] = useState({ type: 'idle', message: '' })
+
+  const providerMeta =
+    PROVIDER_OPTIONS.find((option) => option.value === llmProvider) ?? PROVIDER_OPTIONS[0]
+
+  const fetchHistory = async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/evaluations?limit=10`)
+      if (!response.ok) {
+        throw new Error('Unable to load latest evaluations.')
+      }
+      const items = await response.json()
+      setHistory(items)
+    } catch (error) {
+      console.error(error)
+    }
+  }
+
+  useEffect(() => {
+    // Only fetch history when we reach step 5
+    if (currentStep === 5) {
+      fetchHistory()
+    }
+  }, [currentStep])
+
+  const handleContinueStep1 = () => {
+    if (!rubricText.trim() && !transcriptText.trim()) {
+      setStatus({ type: 'error', message: 'Please provide both rubric and transcript.' })
+      return
+    }
+    setStatus({ type: 'idle', message: '' })
+    setCurrentStep(2)
+  }
+
+  const handleGenerateSkeleton = async () => {
+    if (!rubricText.trim()) {
+      setStatus({ type: 'error', message: 'Please enter rubric text first.' })
+      return
+    }
+
+    setStatus({ type: 'processing', message: 'Parsing rubric...' })
+
+    try {
+      const formData = new FormData()
+      formData.append('rubric_text', rubricText)
+      formData.append('llm_provider', llmProvider)
+
+      const response = await fetch(`${API_BASE_URL}/api/rubrics/parse`, {
+        method: 'POST',
+        body: formData,
+      })
+      const payload = await response.json()
+      if (!response.ok) {
+        throw new Error(payload.detail || 'Unable to parse rubric.')
+      }
+
+      setParsedRubric(payload)
+      setStatus({ type: 'success', message: 'Rubric parsed successfully!' })
+    } catch (error) {
+      setStatus({ type: 'error', message: error.message })
+    }
+  }
+
+  const handleConfirmRubric = async () => {
+    if (!parsedRubric) {
+      setStatus({ type: 'error', message: 'Please parse the rubric first.' })
+      return
+    }
+
+    setStatus({ type: 'processing', message: 'Saving rubric...' })
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/rubrics`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: parsedRubric.title,
+          rubric_type: parsedRubric.rubric_type,
+          items: parsedRubric.items,
+          llm_provider: llmProvider,
+        }),
+      })
+      const payload = await response.json()
+      if (!response.ok) {
+        throw new Error(payload.detail || 'Unable to save rubric.')
+      }
+
+      setSavedRubricId(payload.id)
+      setStatus({ type: 'success', message: 'Rubric confirmed and saved!' })
+      setCurrentStep(3)
+    } catch (error) {
+      setStatus({ type: 'error', message: error.message })
+    }
+  }
+
+  const handleStartGrading = async () => {
+    if (!savedRubricId) {
+      setStatus({ type: 'error', message: 'Please confirm rubric first.' })
+      return
+    }
+    if (!transcriptText.trim()) {
+      setStatus({ type: 'error', message: 'Transcript is required.' })
+      return
+    }
+
+    setStatus({ type: 'processing', message: 'AI is grading transcript...' })
+
+    try {
+      const formData = new FormData()
+      formData.append('transcript_text', transcriptText)
+      formData.append('rubric_id', savedRubricId)
+      formData.append('share_with_student', 'true')
+      formData.append('llm_provider', llmProvider)
+
+      const response = await fetch(`${API_BASE_URL}/api/evaluations/with-rubric`, {
+        method: 'POST',
+        body: formData,
+      })
+      const payload = await response.json()
+      if (!response.ok) {
+        throw new Error(payload.detail || 'Unable to create evaluation.')
+      }
+
+      setEvaluation(payload.evaluation)
+      setStatus({ type: 'success', message: 'Grading completed!' })
+      setCurrentStep(4)
+      fetchHistory()
+    } catch (error) {
+      setStatus({ type: 'error', message: error.message })
+    }
+  }
+
+  const handleDownloadPDF = async (evaluationId) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/evaluations/${evaluationId}/pdf`)
+      if (!response.ok) {
+        throw new Error('Failed to generate PDF')
+      }
+
+      const blob = await response.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `evaluation_${evaluationId}.pdf`
+      document.body.appendChild(a)
+      a.click()
+      window.URL.revokeObjectURL(url)
+      document.body.removeChild(a)
+    } catch (error) {
+      console.error('Error downloading PDF:', error)
+      alert('Failed to download PDF. Please try again.')
+    }
+  }
+
+  return (
+    <div className="wizard-container">
+      <header className="wizard-header">
+        <div className="wizard-title-section">
+          <h1 className="wizard-title">AI Grading System</h1>
+          <p className="wizard-subtitle">Veterinary Consultation Evaluation</p>
+        </div>
+      </header>
+
+      <div className="progress-steps">
+        <StepIndicator number={1} title="Upload Inputs" subtitle="Rubric and transcript" active={currentStep === 1} completed={currentStep > 1} />
+        <div className="step-connector"></div>
+        <StepIndicator number={2} title="Parse Rubric" subtitle="Review and confirm criteria" active={currentStep === 2} completed={currentStep > 2} />
+        <div className="step-connector"></div>
+        <StepIndicator number={3} title="AI Grading" subtitle="Score each criterion" active={currentStep === 3} completed={currentStep > 3} />
+        <div className="step-connector"></div>
+        <StepIndicator number={4} title="Generate Reports" subtitle="Teacher and student reports" active={currentStep === 4} completed={currentStep > 4} />
+        <div className="step-connector"></div>
+        <StepIndicator number={5} title="Validation" subtitle="Compare AI vs human scores" active={currentStep === 5} completed={false} />
+      </div>
+
+      <main className="wizard-content">
+        {currentStep === 1 && (
+          <Step1UploadInputs
+            rubricText={rubricText}
+            setRubricText={setRubricText}
+            transcriptText={transcriptText}
+            setTranscriptText={setTranscriptText}
+            transcriptFile={transcriptFile}
+            setTranscriptFile={setTranscriptFile}
+            onContinue={handleContinueStep1}
+            onGenerateSkeleton={handleGenerateSkeleton}
+            status={status}
+            llmProvider={llmProvider}
+            setLlmProvider={setLlmProvider}
+          />
+        )}
+
+        {currentStep === 2 && (
+          <Step2ParseRubric
+            parsedRubric={parsedRubric}
+            onConfirm={handleConfirmRubric}
+            onBack={() => setCurrentStep(1)}
+            status={status}
+            providerMeta={providerMeta}
+          />
+        )}
+
+        {currentStep === 3 && (
+          <Step3AIGrading
+            onStartGrading={handleStartGrading}
+            onBack={() => setCurrentStep(2)}
+            status={status}
+            providerMeta={providerMeta}
+          />
+        )}
+
+        {currentStep === 4 && (
+          <Step4GenerateReports
+            evaluation={evaluation}
+            onDownloadPDF={handleDownloadPDF}
+            onContinue={() => setCurrentStep(5)}
+            providerMeta={providerMeta}
+          />
+        )}
+
+        {currentStep === 5 && (
+          <Step5Validation
+            history={history}
+            onRefresh={fetchHistory}
+            onDownloadPDF={handleDownloadPDF}
+            onStartOver={() => {
+              setCurrentStep(1)
+              setRubricText('')
+              setTranscriptText('')
+              setParsedRubric(null)
+              setSavedRubricId(null)
+              setEvaluation(null)
+              setStatus({ type: 'idle', message: '' })
+            }}
+          />
+        )}
+      </main>
+    </div>
+  )
+}
+
+function StepIndicator({ number, title, subtitle, active, completed }) {
+  return (
+    <div className="step-indicator">
+      <div className={`step-circle ${active ? 'active' : ''} ${completed ? 'completed' : ''}`}>
+        <span className="step-number">{number}</span>
+      </div>
+      <div className="step-info">
+        <div className="step-title">{title}</div>
+        <div className="step-subtitle">{subtitle}</div>
+      </div>
+    </div>
+  )
+}
+
+function Step1UploadInputs({ rubricText, setRubricText, transcriptText, setTranscriptText, transcriptFile, setTranscriptFile, onContinue, onGenerateSkeleton, status, llmProvider, setLlmProvider }) {
+  const handleFileChange = (event) => {
+    const file = event.target.files[0]
+    if (file) {
+      setTranscriptFile(file)
+      const reader = new FileReader()
+      reader.onload = (e) => {
+        setTranscriptText(e.target.result)
+      }
+      reader.readAsText(file)
+    }
+  }
+
+  return (
+    <div className="step-content">
+      <div className="step-card">
+        <h2>Upload Inputs</h2>
+        <p className="step-description">Upload or paste your grading rubric and consultation transcript</p>
+
+        <div className="provider-select-section">
+          <label htmlFor="provider-select">LLM Provider</label>
+          <select
+            id="provider-select"
+            value={llmProvider}
+            onChange={(event) => setLlmProvider(event.target.value)}
+          >
+            {PROVIDER_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="form-section">
+          <h3>Rubric Input Method</h3>
+          <div className="input-method-choice">
+            <label className="radio-option">
+              <input type="radio" name="rubric-method" defaultChecked />
+              <span>Text-based Input (Paste criteria)</span>
+            </label>
+          </div>
+
+          <div className="rubric-input-area">
+            <label htmlFor="rubric-text">Paste Rubric Text</label>
+            <textarea
+              id="rubric-text"
+              placeholder={`Example:\n1. Communication Skills\n  - Clear articulation\n  - Active listening\n  - Professional tone\n\n2. Medical Knowledge\n  - Accurate diagnosis\n  - Treatment recommendations`}
+              value={rubricText}
+              onChange={(e) => setRubricText(e.target.value)}
+              rows={10}
+            />
+            <p className="input-tip">Tip: Use numbers for main categories (e.g., "1. Category Name") and bullets (-, *) for sub-criteria</p>
+            <button type="button" className="secondary-button" onClick={onGenerateSkeleton}>
+              Generate Rubric Skeleton
+            </button>
+          </div>
+        </div>
+
+        <div className="form-section">
+          <label htmlFor="transcript-file">Consultation Transcript (PDF, DOC, or TXT)</label>
+          <div className="file-input-wrapper">
+            <input
+              type="file"
+              id="transcript-file"
+              accept=".pdf,.doc,.docx,.txt"
+              onChange={handleFileChange}
+            />
+            <label htmlFor="transcript-file" className="file-input-label">
+              {transcriptFile ? transcriptFile.name : 'Choose transcript file...'}
+            </label>
+          </div>
+          <p className="input-tip">Or paste transcript text below:</p>
+          <textarea
+            placeholder="Paste the dialogue between the learner and patient…"
+            value={transcriptText}
+            onChange={(e) => setTranscriptText(e.target.value)}
+            rows={6}
+          />
+        </div>
+
+        {status.message && (
+          <p className={`status ${status.type}`}>{status.message}</p>
+        )}
+
+        <button type="button" className="primary-button" onClick={onContinue}>
+          Continue
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function Step2ParseRubric({ parsedRubric, onConfirm, onBack, status, providerMeta }) {
+  if (!parsedRubric) {
+    return (
+      <div className="step-content">
+        <div className="step-card">
+          <h2>Parse Rubric</h2>
+          <p className="step-description">Review and confirm the extracted criteria</p>
+          <p className="empty-state">No rubric parsed yet. Go back to Step 1 and click "Generate Rubric Skeleton".</p>
+          <button type="button" className="secondary-button" onClick={onBack}>
+            Back to Step 1
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="step-content">
+      <div className="step-card">
+        <h2>Parse Rubric</h2>
+        <p className="step-description">Review and confirm the extracted criteria</p>
+        <p className="provider-note">
+          Parsed using <strong>{providerMeta.label}</strong>
+        </p>
+
+        <div className="rubric-preview">
+          <h3>{parsedRubric.title}</h3>
+          <p className="rubric-type">Type: {parsedRubric.rubric_type}</p>
+
+          <div className="criteria-list">
+            {parsedRubric.items.map((item, index) => (
+              <div key={index} className="criterion-item">
+                <div className="criterion-header">
+                  <span className="criterion-number">{index + 1}</span>
+                  <span className="criterion-name">{item.name}</span>
+                  {item.max_score && <span className="criterion-score">Max: {item.max_score}</span>}
+                </div>
+                {item.description && (
+                  <p className="criterion-description">{item.description}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {status.message && (
+          <p className={`status ${status.type}`}>{status.message}</p>
+        )}
+
+        <div className="button-group">
+          <button type="button" className="secondary-button" onClick={onBack}>
+            Back
+          </button>
+          <button type="button" className="primary-button" onClick={onConfirm}>
+            Confirm & Continue
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function Step3AIGrading({ onStartGrading, onBack, status, providerMeta }) {
+  return (
+    <div className="step-content">
+      <div className="step-card">
+        <h2>AI Grading</h2>
+        <p className="step-description">Score each criterion using AI analysis</p>
+        <p className="provider-note">
+          Scoring powered by <strong>{providerMeta.label}</strong>
+        </p>
+
+        <div className="grading-info">
+          <p>The AI will now evaluate the transcript against each criterion in your rubric. This process may take 20-60 seconds depending on the rubric size.</p>
+          <ul>
+            <li>Each criterion will be scored individually</li>
+            <li>Detailed feedback will be provided for each score</li>
+            <li>An overall performance summary will be generated</li>
+          </ul>
+        </div>
+
+        {status.message && (
+          <p className={`status ${status.type}`}>{status.message}</p>
+        )}
+
+        <div className="button-group">
+          <button type="button" className="secondary-button" onClick={onBack}>
+            Back
+          </button>
+          <button
+            type="button"
+            className="primary-button"
+            onClick={onStartGrading}
+            disabled={status.type === 'processing'}
+          >
+            {status.type === 'processing' ? 'Grading...' : 'Start Grading'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function Step4GenerateReports({ evaluation, onDownloadPDF, onContinue, providerMeta }) {
+  if (!evaluation) {
+    return (
+      <div className="step-content">
+        <div className="step-card">
+          <h2>Generate Reports</h2>
+          <p className="empty-state">No evaluation results yet.</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="step-content">
+      <div className="step-card">
+        <h2>Evaluation Results</h2>
+        <p className="step-description">Review the AI-generated scores and feedback</p>
+
+        <div className="results-summary">
+          <div className="result-header">
+            <div>
+              <p className="eyebrow">{evaluation.rubric_title}</p>
+              <h3 className="performance-band">{evaluation.performance_band}</h3>
+            </div>
+            <div className="score-display">
+              <span className="score-large">
+                {evaluation.total_score}/{evaluation.max_total_score}
+              </span>
+              <button
+                className="secondary-button small"
+                type="button"
+                onClick={() => onDownloadPDF(evaluation.id)}
+                title="Download PDF Report"
+              >
+                Download PDF
+              </button>
+            </div>
+          </div>
+
+          <p className="feedback-summary">{evaluation.feedback_summary}</p>
+
+          <div className="criteria-table">
+            {evaluation.criterion_scores.map((criterion) => (
+              <div key={criterion.id} className="criterion-row">
+                <div className="criterion-info">
+                  <p className="criterion-name">{criterion.name}</p>
+                  <p className="criterion-description">
+                    {criterion.description || 'Free-form criterion'}
+                  </p>
+                </div>
+                <div className="criterion-result">
+                  <span className="criterion-score-value">
+                    {criterion.score}/{criterion.max_score}
+                  </span>
+                  <p className="criterion-feedback">{criterion.feedback}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <button type="button" className="primary-button" onClick={onContinue}>
+          Continue to Validation
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function Step5Validation({ history, onRefresh, onDownloadPDF, onStartOver }) {
+  const [selectedEvalId, setSelectedEvalId] = useState(null)
+  const [selectedEval, setSelectedEval] = useState(null)
+  const [loadingEval, setLoadingEval] = useState(false)
+
+  const handleViewEvaluation = async (evaluationId) => {
+    if (selectedEvalId === evaluationId) {
+      setSelectedEvalId(null)
+      setSelectedEval(null)
+      return
+    }
+
+    setSelectedEvalId(evaluationId)
+    setLoadingEval(true)
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/evaluations/${evaluationId}`)
+      if (!response.ok) {
+        throw new Error('Failed to load evaluation details')
+      }
+      const data = await response.json()
+      setSelectedEval(data)
+    } catch (error) {
+      console.error('Error loading evaluation:', error)
+      setSelectedEval(null)
+    } finally {
+      setLoadingEval(false)
+    }
+  }
+
+  return (
+    <div className="step-content">
+      <div className="step-card">
+        <h2>Validation & History</h2>
+        <p className="step-description">Compare AI evaluations with human scores and review past evaluations</p>
+
+        <div className="history-section">
+          <div className="history-header">
+            <h3>Recent Evaluations</h3>
+            <button className="secondary-button small" type="button" onClick={onRefresh}>
+              Refresh
+            </button>
+          </div>
+
+          {history.length === 0 && <p className="empty-state">No history to display yet.</p>}
+
+          {history.map((item) => (
+            <div key={item.id}>
+              <div
+                className={`history-item ${selectedEvalId === item.id ? 'active' : ''}`}
+                onClick={() => handleViewEvaluation(item.id)}
+              >
+                <div>
+                  <p className="history-title">{item.rubric_title}</p>
+                  <p className="history-meta">
+                    {new Date(item.created_at).toLocaleString()} · {item.performance_band}
+                  </p>
+                </div>
+                <div className="history-actions">
+                  <span className="history-score">
+                    {item.total_score}/{item.max_total_score}
+                  </span>
+                  <button
+                    className="secondary-button small"
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      onDownloadPDF(item.id, e)
+                    }}
+                    title="Download PDF"
+                  >
+                    PDF
+                  </button>
+                </div>
+              </div>
+              {selectedEvalId === item.id && (
+                <div className="history-detail">
+                  {loadingEval ? (
+                    <p>Loading details...</p>
+                  ) : selectedEval ? (
+                    <div className="history-detail-content">
+                      <p className="feedback-summary">{selectedEval.feedback_summary}</p>
+                      {selectedEval.rubric_summary && (
+                        <p className="rubric-hint">
+                          Rubric: {selectedEval.rubric_summary.slice(0, 180)}...
+                        </p>
+                      )}
+                      <div className="criteria-table">
+                        {selectedEval.criterion_scores?.map((criterion) => (
+                          <div key={criterion.id} className="criterion-row">
+                            <div className="criterion-info">
+                              <p className="criterion-name">{criterion.name}</p>
+                              <p className="criterion-description">
+                                {criterion.description || 'Free-form criterion'}
+                              </p>
+                            </div>
+                            <div className="criterion-result">
+                              <span className="criterion-score-value">
+                                {criterion.score}/{criterion.max_score}
+                              </span>
+                              <p className="criterion-feedback">{criterion.feedback}</p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <p>Failed to load evaluation details.</p>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <button type="button" className="primary-button" onClick={onStartOver}>
+          Start New Evaluation
+        </button>
+      </div>
+    </div>
+  )
+}
+
+export default App

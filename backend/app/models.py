@@ -139,6 +139,35 @@ class CriterionScore(Base):
     feedback = Column(Text)
     evidence = Column(Text)
     justification = Column(Text)
+    prompt_used = Column(Text)
 
     evaluation = relationship("Evaluation", back_populates="criterion_scores")
     rubric_item = relationship("RubricItem", back_populates="criterion_scores")
+
+
+class HumanGrading(Base):
+    __tablename__ = "human_gradings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    evaluation_id = Column(Integer, ForeignKey("evaluations.id", ondelete="CASCADE"), nullable=False)
+    total_score = Column(Float, nullable=False)
+    max_total_score = Column(Float, nullable=False)
+    grader_name = Column(String(255))
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    evaluation = relationship("Evaluation")
+    criterion_scores = relationship("HumanCriterionScore", back_populates="human_grading", cascade="all, delete-orphan")
+
+
+class HumanCriterionScore(Base):
+    __tablename__ = "human_criterion_scores"
+
+    id = Column(Integer, primary_key=True, index=True)
+    human_grading_id = Column(Integer, ForeignKey("human_gradings.id", ondelete="CASCADE"), nullable=False)
+    criterion_name = Column(String(255), nullable=False)
+    score = Column(Float, nullable=False)
+    max_score = Column(Float, nullable=False)
+    feedback = Column(Text)
+
+    human_grading = relationship("HumanGrading", back_populates="criterion_scores")

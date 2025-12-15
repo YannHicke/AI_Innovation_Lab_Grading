@@ -5,6 +5,12 @@ from typing import Any, Dict, List
 PROMPT_PLACEHOLDER = "[Transcript will be inserted here]"
 
 
+def build_preview_prompt(item: Dict[str, Any]) -> str:
+    """Render a minimal preview prompt for educators showing only the description."""
+    description = item.get("description") or ""
+    return f"Description: {description}"
+
+
 def build_item_prompt(item: Dict[str, Any], transcript_text: str, rubric_type: str) -> str:
     """Render the per-criterion scoring prompt shared by preview + scoring paths."""
     description = item.get("description") or ""
@@ -13,24 +19,10 @@ def build_item_prompt(item: Dict[str, Any], transcript_text: str, rubric_type: s
     checklist_required = metadata.get("checklist_required")
 
     lines: List[str] = [
-        "You are an impartial assessor of clinical interview skills. You will receive:",
-        "All rubric criterion (including its name, description, and scoring scale).",
-        "",
-        "A cleaned transcript.",
-        "",
-        "Your tasks:",
-        "Score only this specific criterion at a time before moving to the next.",
-        "",
-        "Provide:",
-        "- The numeric score.",
-        "- A brief justification (1–2 sentences).",
-        "- Evidence taken directly from the transcript as an exact quote.",
-        "",
-        "Rules:",
-        "- Do not reference any other criteria.",
-        "- Do not invent or assume transcript content.",
-        "- Evidence must be a verbatim quotation from the transcript.",
-        "- Provide actionable suggestions for improvement.",
+        "You are an impartial assessor of clinical interview skills. "
+        "Evaluate the transcript based on the criterion. "
+        "Provide a numeric score, a brief justification, and evidence in the form of verbatim quotes from the transcript. "
+        "Do not assume or invent content not present in the transcript.",
         "",
         f"Rubric item: {item['name']}",
         f"Description: {description}",

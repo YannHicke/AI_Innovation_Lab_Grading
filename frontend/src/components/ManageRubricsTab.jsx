@@ -63,10 +63,17 @@ function ManageRubricsTab({ savedRubrics, onRubricSaved, llmProvider }) {
     setStatus({ type: 'processing', message: 'Parsing rubric…' })
 
     try {
+      // Add timeout to prevent infinite waiting
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 120000) // 120 second timeout (allow for retries)
+
       const response = await fetch(`${API_BASE_URL}/api/rubrics/parse`, {
         method: 'POST',
         body: formData,
+        signal: controller.signal,
       })
+      clearTimeout(timeoutId)
+
       const payload = await response.json()
       if (!response.ok) {
         throw new Error(payload.detail || 'Unable to parse rubric.')
@@ -81,7 +88,11 @@ function ManageRubricsTab({ savedRubrics, onRubricSaved, llmProvider }) {
       setShowModificationScreen(true)
       setStatus({ type: 'success', message: 'Rubric parsed successfully!' })
     } catch (error) {
-      setError(error.message)
+      if (error.name === 'AbortError') {
+        setError('Parsing timed out after 60 seconds. The LLM may be rate-limited. Please wait a minute and try again.')
+      } else {
+        setError(error.message)
+      }
     }
   }
 
@@ -503,6 +514,101 @@ function RubricParsingPreview({ parsingInfo }) {
     return null
   }
 
+  const isChecklist = parsingInfo.rubric_type === 'checklist'
+
+  // Group criteria by main group (items with IDs like "1", "2") and subgroups (items like "1.1", "1.2")
+  const groupCriteria = (criteria) => {
+    const groups = []
+    const criteriaWithPrompts = criteria.map((criterion, index) => ({
+      ...criterion,
+      prompt: parsingInfo.generated_prompts?.[index]?.prompt_text || '',
+    }))
+
+    criteriaWithPrompts.forEach((criterion) => {
+      const id = criterion.metadata?.id || criterion.name
+      const idStr = String(id)
+
+      // Check if this is a main group (no dot in ID or ID is a single digit/letter)
+      if (!idStr.includes('.') || idStr.match(/^[A-Z0-9]$/i)) {
+        groups.push({
+          main: criterion,
+          subgroups: [],
+        })
+      } else {
+        // This is a subgroup, find its parent
+        const parentId = idStr.split('.')[0]
+        const parentGroup = groups.find(
+          (g) => String(g.main.metadata?.id || g.main.name).startsWith(parentId)
+        )
+        if (parentGroup) {
+          parentGroup.subgroups.push(criterion)
+        } else {
+          // No parent found, treat as main group
+          groups.push({
+            main: criterion,
+            subgroups: [],
+          })
+        }
+      }
+    })
+
+    return groups
+  }
+
+  const renderChecklistTable = () => {
+    const groups = groupCriteria(parsingInfo.criteria)
+
+    return (
+      <div className="checklist-table-container">
+        <h3>Detected Criteria & Prompts</h3>
+        <table className="checklist-table">
+          <thead>
+            <tr>
+              <th style={{ width: '40%' }}>Criterion</th>
+              <th style={{ width: '60%' }}>Generated Prompt</th>
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map((group, groupIndex) => (
+              <>
+                {/* Main group row */}
+                <tr key={`main-${groupIndex}`} className="main-group-row">
+                  <td>
+                    <strong>{group.main.name}</strong>
+                    <div className="criterion-meta">
+                      {group.main.max_score} pts
+                    </div>
+                  </td>
+                  <td>
+                    <pre className="prompt-preview">{group.main.prompt}</pre>
+                  </td>
+                </tr>
+                {/* Subgroup rows */}
+                {group.subgroups.map((subgroup, subIndex) => (
+                  <tr
+                    key={`sub-${groupIndex}-${subIndex}`}
+                    className="subgroup-row"
+                  >
+                    <td className="subgroup-cell">
+                      <span className="subgroup-indent">↳</span>
+                      {subgroup.name}
+                      <div className="criterion-meta">
+                        {subgroup.max_score} pts
+                      </div>
+                    </td>
+                    <td>
+                      <pre className="prompt-preview">{subgroup.prompt}</pre>
+                    </td>
+                  </tr>
+                ))}
+              </>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+
   return (
     <div className="parsing-info">
       <h3>Extraction Summary</h3>
@@ -521,35 +627,45 @@ function RubricParsingPreview({ parsingInfo }) {
         </div>
       </div>
 
-      {parsingInfo.criteria?.length > 0 && (
-        <div className="criteria-list">
-          <h3>Detected Criteria</h3>
-          <ul>
-            {parsingInfo.criteria.map((criterion, index) => (
-              <li key={`${criterion.name}-${index}`}>
-                <strong>{criterion.name}</strong> — {criterion.max_score} pts
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {parsingInfo.generated_prompts?.length > 0 && (
-        <div className="prompts-section">
-          <h3>LLM Prompt Samples</h3>
-          <p className="section-description">
-            These prompts show how the scorer will frame each criterion. The transcript placeholder is substituted at runtime.
-          </p>
-          {parsingInfo.generated_prompts.slice(0, 3).map((prompt, index) => (
-            <div key={`${prompt.criterion_name}-${index}`} className="prompt-item">
-              <button type="button" className="prompt-header">
-                <span className="prompt-criterion">{prompt.criterion_name}</span>
-                <span className="expand-icon">Preview</span>
-              </button>
-              <pre className="prompt-text">{prompt.prompt_text}</pre>
+      {isChecklist && parsingInfo.criteria?.length > 0 ? (
+        renderChecklistTable()
+      ) : (
+        <>
+          {parsingInfo.criteria?.length > 0 && (
+            <div className="criteria-list">
+              <h3>Detected Criteria</h3>
+              <ul>
+                {parsingInfo.criteria.map((criterion, index) => (
+                  <li key={`${criterion.name}-${index}`}>
+                    <strong>{criterion.name}</strong> — {criterion.max_score} pts
+                  </li>
+                ))}
+              </ul>
             </div>
-          ))}
-        </div>
+          )}
+
+          {parsingInfo.generated_prompts?.length > 0 && (
+            <div className="prompts-section">
+              <h3>LLM Prompt Samples</h3>
+              <p className="section-description">
+                These prompts show how the scorer will frame each criterion. The
+                transcript placeholder is substituted at runtime.
+              </p>
+              {parsingInfo.generated_prompts.slice(0, 3).map((prompt, index) => (
+                <div
+                  key={`${prompt.criterion_name}-${index}`}
+                  className="prompt-item"
+                >
+                  <button type="button" className="prompt-header">
+                    <span className="prompt-criterion">{prompt.criterion_name}</span>
+                    <span className="expand-icon">Preview</span>
+                  </button>
+                  <pre className="prompt-text">{prompt.prompt_text}</pre>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   )

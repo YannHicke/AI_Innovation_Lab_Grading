@@ -16,8 +16,9 @@ class Settings(BaseSettings):
     llm_provider: Literal["openai", "anthropic"] = "openai"
     llm_model: Optional[str] = None  # optional global override
     llm_model_openai: str = "gpt-4o-mini"
-    llm_model_anthropic: str = "claude-sonnet-4-5"
+    llm_model_anthropic: str = "claude-sonnet-4-20250514"
     llm_base_url: Optional[str] = None
+    anthropic_base_url: Optional[str] = None
     openai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
     llm_temperature: float = 0.2

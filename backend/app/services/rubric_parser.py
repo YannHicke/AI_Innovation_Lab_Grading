@@ -14,21 +14,38 @@ from pypdf import PdfReader
 from ..config import get_settings
 from .llm_utils import (
     resolve_model_for_provider,
-    ANTHROPIC_STRUCTURED_OUTPUTS_BETA,
-    anthropic_message_call,
     extract_message_payload,
+    normalize_provider,
     parse_llm_json,
 )
-from .prompt_builder import PROMPT_PLACEHOLDER, build_item_prompt
 
 logger = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = (
-    "You are an assistant that converts free-form grading rubrics into structured JSON. "
-    "Extract every criterion you can find without inventing extra ones. "
-    "Only return valid JSON that matches the provided schema."
-)
+SYSTEM_PROMPT = """You are a JSON-only API that extracts rubric criteria from documents.
+
+CRITICAL RULES:
+1. Output ONLY valid JSON - no explanations, no markdown, no code blocks
+2. Start your response with { and end with }
+3. Do not wrap the JSON in ```json``` or any other formatting
+
+Required JSON structure:
+{
+  "rubric_title": "string",
+  "rubric_summary": "string",
+  "max_total_score": number,
+  "rubric_type": "analytic|holistic|single_point|checklist|hybrid",
+  "criteria": [
+    {
+      "name": "string",
+      "description": "string",
+      "max_score": number,
+      "item_type": "criterion",
+      "weight": null,
+      "metadata": {}
+    }
+  ]
+}"""
 
 RUBRIC_TYPES = ["analytic", "holistic", "single_point", "checklist", "hybrid"]
 
@@ -62,8 +79,7 @@ RUBRIC_TEXT_SCHEMA: Dict[str, Any] = {
                                         "description": {"type": ["string", "null"]},
                                         "score": {"type": ["number", "null"]},
                                     },
-                                    "required": ["label", "description", "score"],
-                                    "additionalProperties": False,
+                                    "additionalProperties": True,
                                 },
                             },
                             "checklist_required": {"type": ["boolean", "null"]},
@@ -74,25 +90,14 @@ RUBRIC_TEXT_SCHEMA: Dict[str, Any] = {
                                     "exceeds_description": {"type": ["string", "null"]},
                                     "below_description": {"type": ["string", "null"]},
                                 },
-                                "required": [
-                                    "target_description",
-                                    "exceeds_description",
-                                    "below_description",
-                                ],
-                                "additionalProperties": False,
+                                "additionalProperties": True,
                             },
                             "keywords": {
                                 "type": ["array", "null"],
                                 "items": {"type": "string"},
                             },
                         },
-                        "required": [
-                            "performance_levels",
-                            "checklist_required",
-                            "single_point",
-                            "keywords",
-                        ],
-                        "additionalProperties": False,
+                        "additionalProperties": True,
                     },
                 },
                 "required": [
@@ -139,23 +144,18 @@ class LLMRubricParser:
         if not raw_text or not raw_text.strip():
             raise RubricParsingError("Rubric text is empty.")
 
-        user_message = (
-            "Convert the following rubric into JSON. "
-            "Infer missing numeric maxima conservatively and never invent extra criteria.\n\n"
-            f"RUBRIC SOURCE:\n{raw_text.strip()}"
-        )
+        user_message = f"Extract rubric criteria as JSON:\n\n{raw_text.strip()}"
 
         try:
             if self.provider == "anthropic":
-                response = anthropic_message_call(
-                    self.client,
+                # Anthropic doesn't support response_format like OpenAI
+                # Instead, we rely on the system prompt to enforce JSON output
+                response = self.client.messages.create(
                     model=self.model,
                     max_tokens=self.max_output_tokens,
                     temperature=self.temperature,
                     system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": user_message}],
-                    betas=[ANTHROPIC_STRUCTURED_OUTPUTS_BETA],
-                    output_format={"type": "json_schema", "schema": RUBRIC_TEXT_SCHEMA},
                 )
                 stop_reason = getattr(response, "stop_reason", None)
                 if stop_reason == "max_tokens":
@@ -193,6 +193,12 @@ class LLMRubricParser:
                     )
                 payload = extract_message_payload(message)
         except Exception as exc:  # pragma: no cover - network failure pass-through
+            # Check for rate limit errors
+            error_message = str(exc).lower()
+            if "429" in error_message or "rate" in error_message or "too many requests" in error_message:
+                raise RubricParsingError(
+                    "Rate limit exceeded. Please wait a minute before uploading another rubric, or switch to a different LLM provider in settings."
+                ) from exc
             raise RubricParsingError(f"LLM request failed: {exc}") from exc
 
         if payload in (None, "", []):
@@ -215,7 +221,8 @@ def pdf_bytes_to_text(data: bytes) -> str:
 
 
 def _get_llm_parser(provider_override: str | None) -> LLMRubricParser:
-    provider = _normalize_provider(provider_override)
+    settings = get_settings()
+    provider = normalize_provider(provider_override, settings)
     return _build_llm_parser(provider)
 
 
@@ -232,7 +239,11 @@ def _build_llm_parser(provider: str) -> LLMRubricParser:
     if provider == "anthropic":
         if not settings.anthropic_api_key:
             raise RubricParsingError("Anthropic API key is not configured (APP_ANTHROPIC_API_KEY).")
-        client = Anthropic(api_key=settings.anthropic_api_key)
+        # Allow 2 retries with exponential backoff for rate limits
+        client_kwargs: Dict[str, Any] = {"api_key": settings.anthropic_api_key, "max_retries": 2}
+        if settings.anthropic_base_url:
+            client_kwargs["base_url"] = settings.anthropic_base_url
+        client = Anthropic(**client_kwargs)
     else:  # openai
         if not settings.openai_api_key:
             raise RubricParsingError("OpenAI API key is not configured (APP_OPENAI_API_KEY).")
@@ -338,10 +349,6 @@ def parse_rubric(raw_text: str, provider: str | None = None) -> dict:
             "weight": weight,
             "metadata": metadata,
         }
-        prompt_text = build_item_prompt(criterion_payload, PROMPT_PLACEHOLDER, rubric_type)
-        metadata["prompt_template"] = prompt_text
-        if not criterion_payload["description"]:
-            criterion_payload["description"] = prompt_text
 
         criteria.append(criterion_payload)
 
@@ -443,11 +450,3 @@ def _resolve_criteria_payload(result: Any) -> List[Dict[str, Any]]:
         return _resolve_criteria_payload(nested)
 
     return []
-
-
-def _normalize_provider(provider_override: str | None) -> str:
-    settings = get_settings()
-    candidate = (provider_override or settings.llm_provider or "").strip().lower()
-    if candidate not in {"openai", "anthropic"}:
-        raise RubricParsingError(f"Unsupported LLM provider: {candidate or 'unset'}")
-    return candidate

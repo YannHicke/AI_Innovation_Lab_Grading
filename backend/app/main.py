@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .database import Base, engine, ensure_schema
-from .routers import evaluations, rubrics
+from .routers import evaluations, rubrics, validations
 
 settings = get_settings()
 logging.basicConfig(
@@ -40,3 +40,4 @@ def health() -> dict:
 
 app.include_router(rubrics.router)
 app.include_router(evaluations.router)
+app.include_router(validations.router)

@@ -120,6 +120,33 @@ function EvaluateTranscriptTab({ savedRubrics, history, loadingHistory, onRefres
 }
 
 function ResultPanel({ result }) {
+  const handleDownloadPDF = async (evaluationId) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/evaluations/${evaluationId}/pdf`)
+      if (!response.ok) {
+        throw new Error('Failed to generate PDF')
+      }
+
+      // Create blob from response
+      const blob = await response.blob()
+
+      // Create download link
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `evaluation_${evaluationId}.pdf`
+      document.body.appendChild(a)
+      a.click()
+
+      // Cleanup
+      window.URL.revokeObjectURL(url)
+      document.body.removeChild(a)
+    } catch (error) {
+      console.error('Error downloading PDF:', error)
+      alert('Failed to download PDF. Please try again.')
+    }
+  }
+
   if (!result) {
     return (
       <div>
@@ -136,10 +163,18 @@ function ResultPanel({ result }) {
           <p className="eyebrow">{result.rubric_title}</p>
           <h2>{result.performance_band}</h2>
         </div>
-        <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
           <span className="score">
             {result.total_score}/{result.max_total_score}
           </span>
+          <button
+            className="ghost small"
+            type="button"
+            onClick={() => handleDownloadPDF(result.id)}
+            title="Download PDF Report"
+          >
+            Download PDF
+          </button>
         </div>
       </div>
       <p className="summary">{result.feedback_summary}</p>
@@ -179,6 +214,65 @@ function CriterionTable({ scores }) {
 }
 
 function HistoryPanel({ history, loading, onRefresh }) {
+  const [selectedEvalId, setSelectedEvalId] = useState(null)
+  const [selectedEval, setSelectedEval] = useState(null)
+  const [loadingEval, setLoadingEval] = useState(false)
+
+  const handleViewEvaluation = async (evaluationId) => {
+    if (selectedEvalId === evaluationId) {
+      // Clicking the same item collapses it
+      setSelectedEvalId(null)
+      setSelectedEval(null)
+      return
+    }
+
+    setSelectedEvalId(evaluationId)
+    setLoadingEval(true)
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/evaluations/${evaluationId}`)
+      if (!response.ok) {
+        throw new Error('Failed to load evaluation details')
+      }
+      const data = await response.json()
+      setSelectedEval(data)
+    } catch (error) {
+      console.error('Error loading evaluation:', error)
+      setSelectedEval(null)
+    } finally {
+      setLoadingEval(false)
+    }
+  }
+
+  const handleDownloadPDF = async (evaluationId, event) => {
+    event.stopPropagation() // Prevent triggering the expand/collapse
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/evaluations/${evaluationId}/pdf`)
+      if (!response.ok) {
+        throw new Error('Failed to generate PDF')
+      }
+
+      // Create blob from response
+      const blob = await response.blob()
+
+      // Create download link
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `evaluation_${evaluationId}.pdf`
+      document.body.appendChild(a)
+      a.click()
+
+      // Cleanup
+      window.URL.revokeObjectURL(url)
+      document.body.removeChild(a)
+    } catch (error) {
+      console.error('Error downloading PDF:', error)
+      alert('Failed to download PDF. Please try again.')
+    }
+  }
+
   return (
     <div className="history">
       <div className="history-header">
@@ -189,18 +283,54 @@ function HistoryPanel({ history, loading, onRefresh }) {
       </div>
       {history.length === 0 && <p>No history to display yet.</p>}
       {history.map((item) => (
-        <article key={item.id} className="history-item">
-          <div>
-            <p className="history-title">{item.rubric_title}</p>
-            <p className="history-meta">
-              {new Date(item.created_at).toLocaleString()} ·{' '}
-              {item.performance_band}
-            </p>
-          </div>
-          <span className="history-score">
-            {item.total_score}/{item.max_total_score}
-          </span>
-        </article>
+        <div key={item.id}>
+          <article
+            className={`history-item ${selectedEvalId === item.id ? 'active' : ''}`}
+            onClick={() => handleViewEvaluation(item.id)}
+            style={{ cursor: 'pointer' }}
+          >
+            <div>
+              <p className="history-title">{item.rubric_title}</p>
+              <p className="history-meta">
+                {new Date(item.created_at).toLocaleString()} ·{' '}
+                {item.performance_band}
+              </p>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+              <span className="history-score">
+                {item.total_score}/{item.max_total_score}
+              </span>
+              <button
+                className="ghost small"
+                type="button"
+                onClick={(e) => handleDownloadPDF(item.id, e)}
+                title="Download PDF"
+                style={{ fontSize: '0.85rem', padding: '0.25rem 0.5rem' }}
+              >
+                PDF
+              </button>
+            </div>
+          </article>
+          {selectedEvalId === item.id && (
+            <div className="history-detail">
+              {loadingEval ? (
+                <p>Loading details...</p>
+              ) : selectedEval ? (
+                <div className="history-detail-content">
+                  <p className="summary">{selectedEval.feedback_summary}</p>
+                  {selectedEval.rubric_summary && (
+                    <p className="rubric-hint" style={{ marginTop: '0.5rem' }}>
+                      Rubric: {selectedEval.rubric_summary.slice(0, 180)}...
+                    </p>
+                  )}
+                  <CriterionTable scores={selectedEval.criterion_scores} />
+                </div>
+              ) : (
+                <p>Failed to load evaluation details.</p>
+              )}
+            </div>
+          )}
+        </div>
       ))}
     </div>
   )

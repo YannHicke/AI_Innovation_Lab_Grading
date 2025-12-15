@@ -159,3 +159,11 @@ def anthropic_message_call(client: Any, **kwargs: Any) -> Any:
     if beta_client and hasattr(beta_client, "messages"):
         return beta_client.messages.create(**kwargs)
     return client.messages.create(**kwargs)
+
+
+def normalize_provider(provider_override: str | None, settings: Any) -> str:
+    """Normalize and validate the LLM provider name."""
+    candidate = (provider_override or settings.llm_provider or "").strip().lower()
+    if candidate not in {"openai", "anthropic"}:
+        raise ValueError(f"Unsupported LLM provider: {candidate or 'unset'}")
+    return candidate
